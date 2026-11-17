@@ -834,13 +834,21 @@ export class Session {
   }
   reset() {
     this.resetCount = (this.resetCount || 0) + 1;
+    // A new saved session: its id, when it began, and what happened in it.
+    this.id = `s${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+    this.events = []; this.startedWall = null;
+    this.levelStart = null; this.pctStart = null; this.lastDecile = null;
+    this.announced = false; this.lostAnnounced = false;
     this.meso = new MesoTracker();
     this.exp = new ExpTracker(); this.pct = new PctTracker(this.startLevel);
     this.mode = null; this.votes = []; this.history = [];
     this.elapsedBanked = 0; this.startedAt = this.running ? Date.now() : null;
+    if (this.running) { this.startedWall = Date.now(); this.event(this.startedWall, "start", "Started a new session"); }
   }
   start(now = Date.now()) {
     if (this.running) return;
+    if (this.startedWall === null) { this.startedWall = now; this.event(now, "start", "Started tracking"); }
+    else this.event(now, "pause", "Resumed");
     this.exp.last = null; this.exp.pending = [];
     this.meso.last = null; this.meso.pending = [];
     this.pct.last = null; this.pct.pending = []; this.pct.undo = null;
@@ -848,12 +856,84 @@ export class Session {
   }
   stop(now = Date.now()) {
     if (!this.running) return;
+    this.event(now, "pause", "Paused");
     this.elapsedBanked += (now - this.startedAt) / 1000; this.startedAt = null; this.running = false;
   }
   elapsed(now = Date.now()) {
     return this.elapsedBanked + (this.startedAt ? (now - this.startedAt) / 1000 : 0);
   }
-  setLevel(level) { this.startLevel = level; this.pct.setLevel(level); }
+  setLevel(level) {
+    this.startLevel = level; this.pct.setLevel(level);
+    if (this.levelStart === null || this.mode === "pct") this.levelStart = this.pct.startLevel;
+  }
+
+  /** Something worth showing in the session log. */
+  event(now, kind, text) {
+    this.events.push({ t: now, kind, text });
+    if (this.events.length > 500) this.events.shift();
+  }
+  currentLevel() {
+    if (this.mode === "amount" && this.exp.last) return levelFromAmount(...this.exp.last);
+    if (this.mode === "pct") return this.pct.level;
+    return null;
+  }
+  currentPct() {
+    if (this.mode === "amount" && this.exp.last) return this.exp.last[1];
+    if (this.mode === "pct") return this.pct.last;
+    return null;
+  }
+  /** The summary kept in the saved-sessions history. */
+  record(now = Date.now()) {
+    if (this.startedWall === null) return null;
+    const g = this.gained();
+    return {
+      id: this.id, start: this.startedWall, end: now, played: Math.round(this.elapsed(now)),
+      levelStart: this.levelStart, levelEnd: this.currentLevel(),
+      pctStart: this.pctStart, pctEnd: this.currentPct(),
+      exp: g === null ? null : Math.round(g),
+      pctGained: this.mode === "pct" ? Math.round(this.pct.pctGained * 100) / 100 : null,
+      mesos: this.mesoSeen ? this.meso.gained : null, mesoSpent: this.meso.spent || 0,
+      levelUps: this.mode === "amount" ? this.exp.levels : this.pct.levels,
+      expLost: Math.round((this.mode === "amount" ? this.exp.lost : this.pct.lost) || 0),
+    };
+  }
+  /** Turn a tracker decision into session-log entries. */
+  noteDecision(now, decision, lostBefore) {
+    const fmtN = n => Math.round(n).toLocaleString("en-US");
+    const lv = this.currentLevel(), pct = this.currentPct();
+    if (pct === null) return;
+    if (!this.announced && ACCEPTED.has(decision)) {
+      this.announced = true;
+      this.levelStart = this.levelStart ?? lv; this.pctStart = pct;
+      this.lastDecile = Math.floor(pct / 10);
+      this.event(now, "info", lv ? `Tracking level ${lv} from ${pct.toFixed(2)}%` : `Tracking from ${pct.toFixed(2)}%`);
+      return;
+    }
+    if (decision === "undo") {
+      // The last level-up or death was a misread after all.
+      for (let i = this.events.length - 1; i >= 0; i--)
+        if (this.events[i].kind === "level" || this.events[i].kind === "death") { this.events.splice(i, 1); break; }
+      this.lastDecile = Math.floor(pct / 10);
+      return;
+    }
+    if (decision === "level-up") {
+      this.event(now, "level", lv ? `Level up! Now level ${lv}` : "Level up!");
+      this.lastDecile = Math.floor(pct / 10);
+      return;
+    }
+    if (decision === "death") {
+      const lostNow = (this.mode === "amount" ? this.exp.lost : this.pct.lost) || 0;
+      const d = lostNow - lostBefore;
+      this.event(now, "death", d > 0 ? `Died: lost ${fmtN(d)} EXP` : "Died");
+      this.lastDecile = Math.floor(pct / 10);
+      return;
+    }
+    const dec = Math.floor(pct / 10);
+    if (this.lastDecile !== null && dec > this.lastDecile && ACCEPTED.has(decision)) {
+      this.event(now, "milestone", `Reached ${dec * 10}%${lv ? ` of level ${lv}` : ""}`);
+    }
+    if (ACCEPTED.has(decision)) this.lastDecile = Math.max(this.lastDecile ?? dec, dec);
+  }
   relocate() { this.hud = null; this.lastSearch = 0; }
   gained() { return this.mode === "amount" ? this.exp.gained : this.pct.gained; }
 
@@ -861,6 +941,10 @@ export class Session {
   tick(now, getFrame) {
     if (!this.running) return null;
     const lost = now - this.lastOk > 6000;
+    if (lost && this.hud && !this.lostAnnounced) {
+      this.lostAnnounced = true;
+      this.event(now, "lost", "Can't see the EXP numbers; looking for the HUD");
+    }
     if (!this.hud || (lost && now - this.lastSearch > 5000)) {
       this.status = "searching"; this.lastSearch = now;
       const full = getFrame(null);
@@ -876,6 +960,8 @@ export class Session {
         return row;
       }
       this.miss = null;
+      this.event(now, "hud", this.hadHud ? "Found the HUD again" : "Found the HUD");
+      this.hadHud = true; this.lostAnnounced = false;
       this.hud = hud; this.status = "tracking"; this.lastOk = now;
     }
     const img = getFrame(this.hud.exp);
@@ -889,7 +975,9 @@ export class Session {
       if (!same) parsed = null;
     } else this.prevUnsure = null;
     if (parsed) { this.lastOk = now; this.status = "tracking"; }
+    const lostBefore = (this.mode === "amount" ? this.exp.lost : this.pct.lost) || 0;
     const decision = this.feed(parsed);
+    this.noteDecision(now, decision, lostBefore);
     if (parsed && ACCEPTED.has(decision) && glyphs.length) this.reader.confirm(glyphs);
     const el = this.elapsed(now), g = this.gained();
     if (g !== null && (!this.history.length || el - this.history[this.history.length - 1][0] >= 5)) {
@@ -918,8 +1006,13 @@ export class Session {
     if (!img) return null;
     const r = readMeso(img, this.mesoReader), value = parseMeso(r.text);
     if (value !== null) { this.mesoOk = now; this.mesoSeen = true; }
+    const before = { gained: this.meso.gained, spent: this.meso.spent };
     const decision = this.meso.update(value, r.sure);
     if (value !== null && r.sure && ACCEPTED.has(decision)) this.mesoReader.confirm(r.glyphs);
+    const fmtN = n => Math.round(n).toLocaleString("en-US");
+    if (decision === "spent") this.event(now, "meso", `Spent ${fmtN(this.meso.spent - before.spent)} mesos`);
+    const got = this.meso.gained - before.gained;
+    if (got >= 1000) this.event(now, "meso", `+${fmtN(got)} mesos`);
     return { text: r.text || "", value: value ?? "", decision };
   }
   teachMeso(getFrame, typed) {

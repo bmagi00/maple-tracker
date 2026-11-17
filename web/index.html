@@ -10,7 +10,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Baloo+2:wght@600;800&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="style.css?v=__VERSION__">
 </head>
-<body>
+<body class="idle">
 <main class="page">
   <header class="top">
     <h1 class="mark"><span class="leaf" aria-hidden="true"></span>Maple Tracker</h1>
@@ -20,70 +20,119 @@
     </div>
   </header>
 
-  <section class="hud" aria-label="Level and EXP">
-    <div class="lv"><span class="lv-label">LV.</span><span id="lv-tiles" class="tiles"><span class="tile">?</span></span></div>
-    <div class="gauge-wrap">
-      <div class="gauge-row"><span class="gauge-name">EXP.</span><span id="pct" class="gauge-pct">waiting for the HUD</span></div>
-      <div class="gauge" role="progressbar" aria-valuemin="0" aria-valuemax="100" id="gauge-bar"><div id="gauge-fill" class="gauge-fill"></div></div>
-      <p id="eta" class="eta">Share the window that shows the game, and keep its bottom bar visible.</p>
-    </div>
-  </section>
+  <div class="layout">
+    <div class="live">
+      <section class="hud" aria-label="Level, EXP and session">
+        <div class="hud-main">
+          <div class="lv"><span class="lv-label">LV.</span><span id="lv-tiles" class="tiles"><span class="tile">?</span></span></div>
+          <div class="gauge-wrap">
+            <div class="gauge-row"><span class="gauge-name">EXP.</span><span id="pct" class="gauge-pct">waiting for the HUD</span></div>
+            <div class="gauge" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-label="EXP to next level" id="gauge-bar"><div id="gauge-fill" class="gauge-fill"></div></div>
+            <p id="eta" class="eta">Share the window that shows the game, and keep its bottom bar visible.</p>
+          </div>
+        </div>
+        <div class="strip">
+          <p class="clock"><span id="dot" class="dot" aria-hidden="true"></span><span id="clock">0:00:00</span></p>
+          <p id="status" class="status" aria-live="polite">Not tracking</p>
+          <p id="events" class="events"></p>
+          <div class="controls">
+            <button id="toggle" class="btn small" type="button" disabled>Pause</button>
+            <button id="reset" class="btn ghost small" type="button">Reset</button>
+          </div>
+        </div>
+      </section>
 
-  <div id="prompt" class="prompt" hidden>
-    <form id="prompt-form">
-      <label id="prompt-label" for="prompt-input"></label>
-      <div class="prompt-row">
-        <input id="prompt-input" inputmode="numeric" autocomplete="off" required>
-        <button class="btn primary" type="submit" id="prompt-save">Save</button>
-        <button class="btn ghost" type="button" id="prompt-cancel">Not now</button>
+      <div id="prompt" class="prompt" hidden>
+        <form id="prompt-form">
+          <label id="prompt-label" for="prompt-input"></label>
+          <div class="prompt-row">
+            <input id="prompt-input" inputmode="numeric" autocomplete="off" required>
+            <button class="btn primary" type="submit" id="prompt-save">Save</button>
+            <button class="btn ghost" type="button" id="prompt-cancel">Not now</button>
+          </div>
+          <p id="prompt-error" class="prompt-error" role="alert"></p>
+        </form>
       </div>
-      <p id="prompt-error" class="prompt-error" role="alert"></p>
-    </form>
+
+      <section class="setup" aria-labelledby="setup-title">
+        <h2 id="setup-title">Get set up</h2>
+        <ol class="steps">
+          <li><span><strong>Share the window that shows the game.</strong> On this second computer, that's your Discord, YouTube or Twitch stream.</span></li>
+          <li><span><strong>Keep the game's bottom bar in view.</strong> The tracker finds LV and EXP by itself; rates start 15 seconds later.</span></li>
+          <li><span><strong>Open your Item Inventory</strong> to track mesos. It can sit anywhere on the screen.</span></li>
+        </ol>
+        <button id="share-2" class="btn primary" type="button">Share game window</button>
+        <p class="caution"><strong>Use this on a second device, not the PC you play on.</strong> Nexon's rules can treat screen-reading programs on the gaming PC as unauthorized third-party tools.</p>
+      </section>
+
+      <section class="rates" aria-label="Rates">
+        <div class="rate exp">
+          <h2>EXP per hour</h2>
+          <p class="big" id="exp-hr">–</p>
+          <p class="sub" id="exp-now">&nbsp;</p>
+          <svg id="spark-exp" class="spark" viewBox="0 0 300 64" preserveAspectRatio="none" aria-hidden="true"></svg>
+          <p class="sub" id="exp-total">&nbsp;</p>
+        </div>
+        <div class="rate meso">
+          <h2><span class="coin" aria-hidden="true"></span>Mesos per hour</h2>
+          <p class="big" id="meso-hr">–</p>
+          <p class="sub" id="meso-now">&nbsp;</p>
+          <svg id="spark-meso" class="spark" viewBox="0 0 300 64" preserveAspectRatio="none" aria-hidden="true"></svg>
+          <p class="sub" id="meso-total">Open your Item Inventory window in the game to track mesos.</p>
+        </div>
+      </section>
+    </div>
+
+    <aside class="win log" aria-labelledby="log-title">
+      <h2 id="log-title" class="win-bar">Session log</h2>
+      <div class="win-body">
+        <ol id="log-list" class="log-list" aria-live="polite"></ol>
+        <p id="log-empty" class="empty">Level-ups, deaths, every 10% of a level and big meso pickups show up here as they happen.</p>
+      </div>
+    </aside>
   </div>
 
-  <section class="rates" aria-label="Rates">
-    <div class="rate exp">
-      <h2>EXP per hour</h2>
-      <p class="big" id="exp-hr">–</p>
-      <p class="sub" id="exp-now">&nbsp;</p>
-      <p class="sub" id="exp-total">&nbsp;</p>
+  <section class="win sessions" aria-labelledby="sessions-title">
+    <div class="win-bar">
+      <h2 id="sessions-title">Your sessions</h2>
+      <p id="totals" class="totals"></p>
     </div>
-    <div class="rate meso">
-      <h2><span class="coin" aria-hidden="true"></span>Mesos per hour</h2>
-      <p class="big" id="meso-hr">–</p>
-      <p class="sub" id="meso-now">&nbsp;</p>
-      <p class="sub" id="meso-total">Open your Item Inventory window in the game to track mesos.</p>
-    </div>
-  </section>
-
-  <section class="session" aria-label="Session">
-    <p class="clock"><span id="dot" class="dot" aria-hidden="true"></span><span id="clock">0:00:00</span> <span id="status" class="status">Not tracking</span></p>
-    <p id="events" class="events"></p>
-    <div class="controls">
-      <button id="toggle" class="btn" type="button" disabled>Pause</button>
-      <button id="reset" class="btn ghost" type="button">Reset</button>
+    <div class="win-body">
+      <div class="table-wrap">
+        <table id="sessions-table">
+          <thead><tr><th scope="col">Day</th><th scope="col">Played</th><th scope="col">Level</th><th scope="col" class="num">EXP</th><th scope="col" class="num">EXP/hr</th><th scope="col" class="num">Mesos</th><th scope="col" class="num">Mesos/hr</th><th scope="col"><span class="sr">Delete</span></th></tr></thead>
+          <tbody id="sessions-body"></tbody>
+        </table>
+      </div>
+      <p id="sessions-empty" class="empty">Each session saves here by itself once you've tracked for 30 seconds. Reset starts a new one.</p>
+      <div class="sessions-actions">
+        <button id="sessions-csv" class="btn ghost small" type="button">Download sessions (CSV)</button>
+        <button id="sessions-clear" class="btn ghost small" type="button">Clear history</button>
+      </div>
     </div>
   </section>
 
-  <section class="sees" aria-label="What the tracker sees">
-    <h2>What it sees</h2>
-    <div class="sees-grid">
-      <figure><canvas id="see-exp" width="300" height="48"></canvas><figcaption id="see-exp-text">EXP: –</figcaption></figure>
-      <figure><canvas id="see-meso" width="300" height="48"></canvas><figcaption id="see-meso-text">Mesos: –</figcaption></figure>
+  <details class="trouble">
+    <summary>Troubleshooting</summary>
+    <div class="trouble-body">
+      <h3>What it sees</h3>
+      <div class="sees-grid">
+        <figure><canvas id="see-exp" width="300" height="48"></canvas><figcaption id="see-exp-text">EXP: –</figcaption></figure>
+        <figure><canvas id="see-meso" width="300" height="48"></canvas><figcaption id="see-meso-text">Mesos: –</figcaption></figure>
+      </div>
+      <div class="tools">
+        <button id="set-level" class="btn ghost small" type="button">Set my level</button>
+        <button id="teach-meso" class="btn ghost small" type="button">Teach meso digits</button>
+        <button id="refind" class="btn ghost small" type="button">Find the HUD again</button>
+        <button id="download" class="btn ghost small" type="button">Download reading log</button>
+        <button id="snapshot" class="btn ghost small" type="button">Save what it sees (picture)</button>
+        <label class="btn ghost small file">Test with a video file<input id="file" type="file" accept="video/*" hidden></label>
+      </div>
     </div>
-    <div class="tools">
-      <button id="set-level" class="btn ghost small" type="button">Set my level</button>
-      <button id="teach-meso" class="btn ghost small" type="button">Teach meso digits</button>
-      <button id="refind" class="btn ghost small" type="button">Find the HUD again</button>
-      <button id="download" class="btn ghost small" type="button">Download reading log</button>
-      <button id="snapshot" class="btn ghost small" type="button">Save what it sees (picture)</button>
-      <label class="btn ghost small file">Test with a video file<input id="file" type="file" accept="video/*" hidden></label>
-    </div>
-  </section>
+  </details>
 
   <footer class="foot">
-    <p><strong>Use this on a second device, not the PC you play on.</strong> Nexon's rules can treat screen-reading programs on the gaming PC as unauthorized third-party tools. Watch your Discord, YouTube or Twitch stream on another computer and share that window here.</p>
-    <p>Everything runs in this tab. The picture and the readings never leave your computer.</p>
+    <p>Everything runs in this tab. The picture and the readings never leave your computer. Use it on a second device, not the PC you play on.</p>
     <p class="version">Version __VERSION__</p>
   </footer>
 </main>

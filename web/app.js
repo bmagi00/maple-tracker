@@ -23,6 +23,130 @@ const session = new Session(hudReader, {
   mesoReader,
 });
 
+// -------------------------------------------------------- saved sessions
+const SESS_KEY = "mt.sessions";
+let saved = store.get(SESS_KEY, []);
+let lastSessionSave = 0;
+/** Save (or update) the current session in the history. */
+function saveCurrent() {
+  const r = session.record();
+  lastSessionSave = Date.now();
+  if (!r || r.played < 30) return;
+  const i = saved.findIndex(s => s.id === r.id);
+  if (i >= 0) saved[i] = r; else saved.unshift(r);
+  saved = saved.slice(0, 500);
+  store.set(SESS_KEY, saved);
+  renderSessions();
+}
+addEventListener("pagehide", saveCurrent);
+document.addEventListener("visibilitychange", () => { if (document.hidden) saveCurrent(); });
+
+const compact = n => {
+  if (n === null || n === undefined) return "–";
+  const a = Math.abs(n);
+  if (a < 1000) return String(Math.round(n));
+  if (a < 1e6) return `${(n / 1e3).toFixed(a < 1e4 ? 1 : 0)}k`;
+  return `${(n / 1e6).toFixed(a < 1e7 ? 2 : 1)}M`;
+};
+const playedText = s => { s = Math.round(s); const h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60;
+  return h ? `${h}h ${String(m).padStart(2, "0")}m` : m ? `${m}m` : `${s}s`; };
+const dayText = t => new Date(t).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+const levelText = s => !s.levelStart && !s.levelEnd ? "–"
+  : s.levelEnd && s.levelStart && s.levelEnd !== s.levelStart ? `${s.levelStart} → ${s.levelEnd}` : String(s.levelEnd || s.levelStart);
+
+function renderSessions() {
+  const cur = session.record();
+  const rows = [...(cur && cur.played >= 30 ? [{ ...cur, current: true }] : []), ...saved.filter(s => !cur || s.id !== cur.id)];
+  const body = $("sessions-body");
+  // best EXP/hr among sessions long enough for the rate to mean something
+  const rated = rows.filter(s => s.exp !== null && s.played >= 300);
+  const best = rated.length > 1 ? rated.reduce((b, s) => s.exp / s.played > b.exp / b.played ? s : b) : null;
+  body.replaceChildren(...rows.map(s => {
+    const tr = document.createElement("tr");
+    if (s.current) tr.className = "current";
+    const hrs = s.played / 3600;
+    const expTxt = s.exp !== null ? `+${compact(s.exp)}` : s.pctGained !== null ? `+${s.pctGained}%` : "–";
+    const cells = [
+      [dayText(s.start), ""], [playedText(s.played), ""], [levelText(s), ""],
+      [expTxt, "num exp-cell"], [s.exp !== null && hrs > 0 ? compact(s.exp / hrs) : "–", "num"],
+      [s.mesos !== null ? `+${compact(s.mesos)}` : "–", "num meso-cell"],
+      [s.mesos !== null && hrs > 0 ? compact(s.mesos / hrs) : "–", "num"],
+    ];
+    for (const [text, cls] of cells) { const td = document.createElement("td"); td.textContent = text; if (cls) td.className = cls; tr.append(td); }
+    const tag = (td, cls, text) => td.append(Object.assign(document.createElement("span"), { className: `tag ${cls}`, textContent: text }));
+    if (s.current) tag(tr.children[0], "now", "Now");
+    if (best && s.id === best.id) tag(tr.children[4], "best", "Best");
+    const td = document.createElement("td");
+    if (!s.current) {
+      const del = Object.assign(document.createElement("button"), { className: "del", type: "button", textContent: "✕", title: "Delete this session" });
+      del.setAttribute("aria-label", `Delete the session from ${dayText(s.start)}`);
+      del.onclick = () => { saved = saved.filter(x => x.id !== s.id); store.set(SESS_KEY, saved); renderSessions(); };
+      td.append(del);
+    }
+    tr.append(td);
+    return tr;
+  }));
+  $("sessions-table").hidden = !rows.length;
+  $("sessions-empty").hidden = !!rows.length;
+  const played = rows.reduce((a, s) => a + s.played, 0), exp = rows.reduce((a, s) => a + (s.exp || 0), 0);
+  const mesos = rows.reduce((a, s) => a + (s.mesos || 0), 0);
+  $("totals").textContent = rows.length
+    ? `${rows.length} session${rows.length > 1 ? "s" : ""}, ${playedText(played)} played, ${compact(exp)} EXP, ${compact(mesos)} mesos`
+    : "";
+}
+
+// cumulative EXP and mesos over the session, for the small charts under the rates
+const trail = { id: null, pts: [], step: 5, lastT: -Infinity, drawn: -1 };
+function sampleTrail(s) {
+  if (trail.id !== session.id) Object.assign(trail, { id: session.id, pts: [], step: 5, lastT: -Infinity, drawn: -1 });
+  if (!s.running || s.elapsed - trail.lastT < trail.step) return;
+  trail.lastT = s.elapsed;
+  trail.pts.push([s.elapsed, s.exp, s.mesos]);
+  if (trail.pts.length > 360) { trail.pts = trail.pts.filter((_, i) => i % 2 === 0); trail.step *= 2; }
+}
+function drawSpark(svg, k) {
+  const pts = trail.pts.filter(p => p[k] !== null && p[k] !== undefined);
+  if (pts.length < 2) { svg.replaceChildren(); return; }
+  const t0 = pts[0][0], t1 = pts[pts.length - 1][0];
+  let lo = Math.min(0, ...pts.map(p => p[k])), hi = Math.max(...pts.map(p => p[k]));
+  if (hi - lo < 1) hi = lo + 1;
+  const W = 300, H = 64, pad = 3;
+  const xy = pts.map(p => [((p[0] - t0) / Math.max(1, t1 - t0)) * W, H - pad - ((p[k] - lo) / (hi - lo)) * (H - 2 * pad)]);
+  const d = xy.map(([x, y], i) => `${i ? "L" : "M"}${x.toFixed(1)},${y.toFixed(1)}`).join("");
+  const ns = "http://www.w3.org/2000/svg";
+  const area = document.createElementNS(ns, "path"); area.setAttribute("class", "area"); area.setAttribute("d", `${d}L${W},${H}L0,${H}Z`);
+  const line = document.createElementNS(ns, "path"); line.setAttribute("class", "line"); line.setAttribute("d", d);
+  svg.replaceChildren(area, line);
+}
+function renderTrail(s) {
+  sampleTrail(s);
+  if (trail.drawn === trail.pts.length) return;
+  trail.drawn = trail.pts.length;
+  drawSpark($("spark-exp"), 1);
+  drawSpark($("spark-meso"), 2);
+}
+
+let renderedEvents = -1;
+function renderLog() {
+  const ev = session.events;
+  const key = ev.length + (ev[ev.length - 1]?.t || 0);
+  if (key === renderedEvents) return;
+  renderedEvents = key;
+  const list = $("log-list");
+  list.replaceChildren(...ev.slice(-200).reverse().map(e => {
+    const li = document.createElement("li");
+    li.className = `ev-${e.kind}`;
+    const time = document.createElement("time");
+    time.dateTime = new Date(e.t).toISOString();
+    time.textContent = new Date(e.t).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+    const mark = document.createElement("span"); mark.className = "mark"; mark.setAttribute("aria-hidden", "true");
+    const text = document.createElement("span"); text.textContent = e.text;
+    li.append(time, mark, text);
+    return li;
+  }));
+  $("log-empty").hidden = ev.length > 0;
+}
+
 // ---------------------------------------------------------------- capture
 const video = $("video"), work = $("work");
 const wctx = work.getContext("2d", { willReadFrequently: true });
@@ -40,7 +164,7 @@ async function shareWindow() {
     });
     stopSource();
     stream = s; track = s.getVideoTracks()[0];
-    track.addEventListener("ended", () => { stopSource(); session.stop(); render(); });
+    track.addEventListener("ended", () => { stopSource(); session.stop(); saveCurrent(); render(); });
     imageCapture = "ImageCapture" in window ? new ImageCapture(track) : null;
     video.srcObject = s; await video.play();
     source = "window";
@@ -110,6 +234,7 @@ metronome.onmessage = async () => {
         frame.bitmap?.close?.();
       }
     }
+    if (session.running && Date.now() - lastSessionSave > 15000) saveCurrent();
     if (Date.now() - lastSave > 30000) {
       lastSave = Date.now();
       if (hudReader.dirty) { store.set("mt.learned.hud", hudReader.learned); hudReader.dirty = false; }
@@ -204,6 +329,10 @@ function render() {
   if (s.needsLevel && !asked.level && !promptOpen) askLevel("Your HUD shows only the EXP percentage. What level is your character? I'll turn % into EXP from here.");
   else if (s.mesoNeedsTeach && !asked.meso && !promptOpen) askMeso();
 
+  document.body.classList.toggle("idle", !source && !s.elapsed);
+  renderTrail(s);
+  renderLog();
+  if (Date.now() - (render.sessionsAt || 0) > 5000) { render.sessionsAt = Date.now(); renderSessions(); }
   document.title = s.running && s.expHr ? `${fmt(s.expHr)} EXP/hr · Maple Tracker` : "Maple Tracker";
   renderPip(s);
 }
@@ -287,10 +416,29 @@ function renderPip(s) {
 }
 
 // ---------------------------------------------------------------- controls
-function toggle() { if (!source) return; session.running ? session.stop() : session.start(); render(); }
+function toggle() { if (!source) return; session.running ? session.stop() : session.start(); saveCurrent(); render(); }
 $("share").onclick = shareWindow;
+$("share-2").onclick = shareWindow;
 $("toggle").onclick = toggle;
-$("reset").onclick = () => { session.reset(); session.log = []; render(); };
+$("reset").onclick = () => {
+  saveCurrent();                       // the finished session stays in the history
+  session.reset(); session.log = [];
+  render(); renderSessions();
+};
+$("sessions-csv").onclick = () => {
+  const cols = ["start", "end", "played_s", "level_start", "level_end", "pct_start", "pct_end", "exp", "pct_gained", "exp_per_hr", "mesos", "mesos_per_hr", "mesos_spent", "level_ups", "exp_lost"];
+  const rows = saved.map(s => [new Date(s.start).toISOString(), new Date(s.end).toISOString(), s.played, s.levelStart, s.levelEnd,
+    s.pctStart, s.pctEnd, s.exp, s.pctGained, s.exp !== null && s.played ? Math.round(s.exp / (s.played / 3600)) : "",
+    s.mesos, s.mesos !== null && s.played ? Math.round(s.mesos / (s.played / 3600)) : "", s.mesoSpent, s.levelUps, s.expLost]);
+  const esc = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const csv = [cols.join(","), ...rows.map(r => r.map(esc).join(","))].join("\n");
+  const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(new Blob([csv], { type: "text/csv" })), download: "maple-tracker-sessions.csv" });
+  a.click(); URL.revokeObjectURL(a.href);
+};
+$("sessions-clear").onclick = () => {
+  if (!saved.length || !confirm("Delete all saved sessions? This can't be undone.")) return;
+  saved = []; store.set(SESS_KEY, saved); renderSessions();
+};
 $("set-level").onclick = () => askLevel();
 $("teach-meso").onclick = () => askMeso();
 $("refind").onclick = () => { session.relocate(); session.mesoBox = null; showStatus("Looking for the HUD again"); };
