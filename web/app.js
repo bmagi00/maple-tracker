@@ -104,7 +104,7 @@ metronome.onmessage = async () => {
     if (session.running && source) {
       const frame = await currentFrame();
       if (frame) {
-        lastFrame = frame;
+        lastFrame = { w: frame.w, h: frame.h };
         session.tick(Date.now(), box => region(frame, box));
         drawSees(frame);
         frame.bitmap?.close?.();
@@ -189,7 +189,7 @@ function render() {
   if (statusOverride && Date.now() < statusOverride.until) ({ msg, warn } = statusOverride);
   else if (!source) msg = "Not tracking";
   else if (!s.running) msg = "Paused";
-  else if (s.status === "searching") msg = "Looking for the HUD";
+  else if (s.status === "searching") { msg = session.miss ? `Looking for the HUD. ${session.miss}` : "Looking for the HUD"; warn = !!session.miss; }
   else if (s.stale) { msg = "Can't read the EXP right now. Is something covering the bottom bar?"; warn = true; }
   else msg = source === "file" ? "Tracking the video" : "Tracking";
   st.textContent = msg; st.classList.toggle("warn", warn);
@@ -218,9 +218,9 @@ function openPrompt(kind, label, initial, onSave) {
   $("prompt-error").textContent = "";
   $("prompt").hidden = false;
   $("prompt-input").focus();
-  $("prompt-form").onsubmit = e => {
+  $("prompt-form").onsubmit = async e => {
     e.preventDefault();
-    const err = onSave($("prompt-input").value.trim());
+    const err = await onSave($("prompt-input").value.trim());
     if (err) { $("prompt-error").textContent = err; return; }
     closePrompt();
   };
@@ -240,13 +240,18 @@ function askLevel(label = "What level is your character right now?") {
 function askMeso() {
   asked.meso = true;
   openPrompt("meso", "I can see your meso total but don't know all of its digits yet. Type the number shown in the inventory, and I'll learn them.", "", v => {
-    if (!lastFrame) return "Share the game window first.";
-    const err = session.teachMeso(box => region(lastFrame, box), v);
-    if (!err) store.set("mt.learned.meso", mesoReader.learned);
-    return err;
+    if (!source) return "Share the game window first.";
+    return teachFromCurrentFrame(v);
   });
 }
-
+async function teachFromCurrentFrame(v) {
+  const frame = await currentFrame();
+  if (!frame) return "Share the game window first.";
+  const err = session.teachMeso(box => region(frame, box), v);
+  frame.bitmap?.close?.();
+  if (!err) store.set("mt.learned.meso", mesoReader.learned);
+  return err;
+}
 // ---------------------------------------------------------------- pop-out
 async function popOut() {
   if (pip) { pip.focus?.(); return; }
@@ -291,7 +296,7 @@ $("teach-meso").onclick = () => askMeso();
 $("refind").onclick = () => { session.relocate(); session.mesoBox = null; showStatus("Looking for the HUD again"); };
 $("file").onchange = e => { const f = e.target.files[0]; if (f) openVideo(f); e.target.value = ""; };
 $("download").onclick = () => {
-  const cols = ["time", "text", "exp", "pct", "decision", "gained", "mesoText", "meso", "mesoDecision"];
+  const cols = ["time", "text", "exp", "pct", "decision", "gained", "mesoText", "meso", "mesoDecision", "note"];
   const esc = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
   const csv = [cols.join(","), ...session.log.map(r => cols.map(c => esc(r[c])).join(","))].join("\n");
   const a = Object.assign(document.createElement("a"), {
@@ -299,6 +304,17 @@ $("download").onclick = () => {
     download: `maple-tracker-readings-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-")}.csv`,
   });
   a.click(); URL.revokeObjectURL(a.href);
+};
+$("snapshot").onclick = async () => {
+  const frame = lastFrame && source ? await currentFrame() : null;
+  if (!frame) { showStatus("Share the game window first.", true); return; }
+  const c = document.createElement("canvas"); c.width = frame.w; c.height = frame.h;
+  c.getContext("2d").drawImage(frame.src, 0, 0);
+  frame.bitmap?.close?.();
+  c.toBlob(b => {
+    const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(b), download: "maple-tracker-what-it-sees.png" });
+    a.click(); URL.revokeObjectURL(a.href);
+  }, "image/png");
 };
 if ("documentPictureInPicture" in window) { $("popout").hidden = false; $("popout").onclick = popOut; }
 if (!navigator.mediaDevices?.getDisplayMedia) showStatus("Window sharing needs Chrome or Edge on a computer.", true);

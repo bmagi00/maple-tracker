@@ -243,16 +243,34 @@ export function locateReadout(img, run, reader) {
   return null;
 }
 
-export function findHud(img, reader) {
-  const scored = orangeRuns(img).map(r => [lvLabelScore(img, r), r]).sort((a, b) => b[0] - a[0]);
+export function findHud(img, reader, why = {}) {
+  const runs = orangeRuns(img);
+  const scored = runs.map(r => [lvLabelScore(img, r), r]).sort((a, b) => b[0] - a[0]);
+  Object.assign(why, { frame: `${img.w}x${img.h}`, orange: runs.length,
+                       lvTiles: scored.filter(s => s[0] > 0).length, tried: [] });
   for (const [score, run] of scored.slice(0, 4)) {
     if (score <= 0) break;
     const box = locateReadout(img, run, reader);
     // Only accept a spot whose numbers actually read as an EXP readout,
     // so look-alikes elsewhere on screen are skipped.
-    if (box && parseHudText(reader.read(crop(img, ...box)).text)) return { tiles: run, exp: box };
+    const text = box ? reader.read(crop(img, ...box)).text : null;
+    why.tried.push({ tiles: run, box, text });
+    if (box && parseHudText(text)) return { tiles: run, exp: box };
   }
   return null;
+}
+
+/** Plain-language reason the HUD wasn't found, for the page. */
+export function explainMiss(why) {
+  if (!why.frame) return "No picture from the shared window yet.";
+  if (!why.lvTiles) return why.orange
+    ? "Can't see the level tiles (LV.) - is the game's bottom bar visible and big enough?"
+    : "Can't see the game's bottom bar in the shared window.";
+  const t = why.tried[0];
+  const th = t ? t.tiles[3] : 0;
+  if (th && th < 16) return `The game looks small (level tiles ${th}px tall). Make the stream fullscreen or bigger.`;
+  if (!t?.box) return "Found the level tiles, but not the EXP numbers next to them.";
+  return `Found the EXP numbers but can't read them yet (reads "${t.text || "nothing"}"). A bigger, sharper stream helps.`;
 }
 
 // ------------------------------------------------------------ meso field
@@ -834,9 +852,18 @@ export class Session {
     if (!this.hud || (lost && now - this.lastSearch > 5000)) {
       this.status = "searching"; this.lastSearch = now;
       const full = getFrame(null);
-      if (!full) return null;
-      const hud = findHud(full, this.reader);
-      if (!hud) return null;
+      if (!full) { this.miss = "No picture from the shared window yet."; return null; }
+      const why = {};
+      const hud = findHud(full, this.reader, why);
+      if (!hud) {
+        this.miss = explainMiss(why);
+        const row = { time: new Date(now).toISOString(), text: why.tried[0]?.text || "", exp: "", pct: "",
+                      decision: "hud-not-found", gained: "", mesoText: "", meso: "", mesoDecision: "",
+                      note: `${why.frame}; orange ${why.orange}; LV tiles ${why.lvTiles}; tried ${JSON.stringify(why.tried)}` };
+        this.log.push(row); if (this.log.length > 20000) this.log.shift();
+        return row;
+      }
+      this.miss = null;
       this.hud = hud; this.status = "tracking"; this.lastOk = now;
     }
     const img = getFrame(this.hud.exp);
