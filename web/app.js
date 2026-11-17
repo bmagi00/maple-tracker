@@ -1,8 +1,8 @@
 // Maple Tracker - the page. Captures a shared window (or a video file),
 // hands frames to the engine twice a second, and shows the numbers.
-import { DigitReader, Session, crop, expToNext } from "./engine.js";
-import { SEEDS } from "./seeds.js";
-import { MESO_SEEDS } from "./seeds-meso.js";
+import { DigitReader, Session, crop, expToNext } from "./engine.js?v=__VERSION__";
+import { SEEDS } from "./seeds.js?v=__VERSION__";
+import { MESO_SEEDS } from "./seeds-meso.js?v=__VERSION__";
 
 const $ = id => document.getElementById(id);
 const store = {
