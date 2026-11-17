@@ -9,6 +9,7 @@ name: Build apps
 on:
   push:
     branches: [main]
+    paths-ignore: ["web/**", ".github/workflows/pages.yml"]   # the web version publishes separately
   workflow_dispatch:
 
 permissions:

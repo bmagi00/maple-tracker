@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Maple Tracker</title>
+<meta name="description" content="EXP and mesos per hour for MapleStory Classic, read from a shared window. Runs in your browser; nothing is uploaded.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Baloo+2:wght@600;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main class="page">
+  <header class="top">
+    <h1 class="mark"><span class="leaf" aria-hidden="true"></span>Maple Tracker</h1>
+    <div class="top-actions">
+      <button id="popout" class="btn ghost" type="button" hidden>Pop out</button>
+      <button id="share" class="btn primary" type="button">Share game window</button>
+    </div>
+  </header>
+
+  <section class="hud" aria-label="Level and EXP">
+    <div class="lv"><span class="lv-label">LV.</span><span id="lv-tiles" class="tiles"><span class="tile">?</span></span></div>
+    <div class="gauge-wrap">
+      <div class="gauge-row"><span class="gauge-name">EXP.</span><span id="pct" class="gauge-pct">waiting for the HUD</span></div>
+      <div class="gauge" role="progressbar" aria-valuemin="0" aria-valuemax="100" id="gauge-bar"><div id="gauge-fill" class="gauge-fill"></div></div>
+      <p id="eta" class="eta">Share the window that shows the game, and keep its bottom bar visible.</p>
+    </div>
+  </section>
+
+  <div id="prompt" class="prompt" hidden>
+    <form id="prompt-form">
+      <label id="prompt-label" for="prompt-input"></label>
+      <div class="prompt-row">
+        <input id="prompt-input" inputmode="numeric" autocomplete="off" required>
+        <button class="btn primary" type="submit" id="prompt-save">Save</button>
+        <button class="btn ghost" type="button" id="prompt-cancel">Not now</button>
+      </div>
+      <p id="prompt-error" class="prompt-error" role="alert"></p>
+    </form>
+  </div>
+
+  <section class="rates" aria-label="Rates">
+    <div class="rate exp">
+      <h2>EXP per hour</h2>
+      <p class="big" id="exp-hr">–</p>
+      <p class="sub" id="exp-now">&nbsp;</p>
+      <p class="sub" id="exp-total">&nbsp;</p>
+    </div>
+    <div class="rate meso">
+      <h2><span class="coin" aria-hidden="true"></span>Mesos per hour</h2>
+      <p class="big" id="meso-hr">–</p>
+      <p class="sub" id="meso-now">&nbsp;</p>
+      <p class="sub" id="meso-total">Open your Item Inventory window in the game to track mesos.</p>
+    </div>
+  </section>
+
+  <section class="session" aria-label="Session">
+    <p class="clock"><span id="dot" class="dot" aria-hidden="true"></span><span id="clock">0:00:00</span> <span id="status" class="status">Not tracking</span></p>
+    <p id="events" class="events"></p>
+    <div class="controls">
+      <button id="toggle" class="btn" type="button" disabled>Pause</button>
+      <button id="reset" class="btn ghost" type="button">Reset</button>
+    </div>
+  </section>
+
+  <section class="sees" aria-label="What the tracker sees">
+    <h2>What it sees</h2>
+    <div class="sees-grid">
+      <figure><canvas id="see-exp" width="300" height="48"></canvas><figcaption id="see-exp-text">EXP: –</figcaption></figure>
+      <figure><canvas id="see-meso" width="300" height="48"></canvas><figcaption id="see-meso-text">Mesos: –</figcaption></figure>
+    </div>
+    <div class="tools">
+      <button id="set-level" class="btn ghost small" type="button">Set my level</button>
+      <button id="teach-meso" class="btn ghost small" type="button">Teach meso digits</button>
+      <button id="refind" class="btn ghost small" type="button">Find the HUD again</button>
+      <button id="download" class="btn ghost small" type="button">Download reading log</button>
+      <label class="btn ghost small file">Test with a video file<input id="file" type="file" accept="video/*" hidden></label>
+    </div>
+  </section>
+
+  <footer class="foot">
+    <p><strong>Use this on a second device, not the PC you play on.</strong> Nexon's rules can treat screen-reading programs on the gaming PC as unauthorized third-party tools. Watch your Discord, YouTube or Twitch stream on another computer and share that window here.</p>
+    <p>Everything runs in this tab. The picture and the readings never leave your computer.</p>
+  </footer>
+</main>
+
+<video id="video" muted playsinline hidden></video>
+<canvas id="work" hidden></canvas>
+
+<template id="mini">
+  <div class="mini">
+    <div class="mini-head"><span class="dot" data-k="dot"></span><span data-k="clock">0:00:00</span><span class="mini-lv" data-k="lv"></span></div>
+    <div class="mini-gauge"><div class="gauge-fill" data-k="fill"></div></div>
+    <p class="mini-eta" data-k="eta"></p>
+    <p class="mini-num"><span data-k="exphr">–</span><small>EXP/hr</small></p>
+    <p class="mini-sub" data-k="expnow"></p>
+    <p class="mini-num meso"><span data-k="mesohr">–</span><small>mesos/hr</small></p>
+    <button class="btn small" type="button" data-k="toggle">Pause</button>
+  </div>
+</template>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

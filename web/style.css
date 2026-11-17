@@ -1,0 +1,120 @@
+/* Maple Tracker - styled after MapleStory Classic's own interface:
+   slate window chrome, orange level tiles, the yellow-green EXP gauge,
+   and gold for mesos. */
+:root {
+  --slate-900: #1f2632;   /* page */
+  --slate-800: #2a3342;   /* HUD bar */
+  --slate-700: #3a4556;   /* window chrome */
+  --steel-200: #c9d3e2;   /* inventory window frame */
+  --paper: #f4f6fa;       /* text on dark */
+  --muted: #9aa7ba;
+  --tile: #f08a24;        /* level tiles */
+  --tile-edge: #b85c0c;
+  --gauge: #c6e01b;       /* EXP fill */
+  --gauge-deep: #7fa20a;
+  --gold: #f5c518;        /* mesos */
+  --alert: #ff8a6b;
+  --display: "Baloo 2", "Trebuchet MS", system-ui, sans-serif;
+  --text: "Atkinson Hyperlegible", system-ui, sans-serif;
+}
+* { box-sizing: border-box; }
+html { background: var(--slate-900); color: var(--paper); }
+body { margin: 0; font: 17px/1.5 var(--text); }
+.page { max-width: 880px; margin: 0 auto; padding: 24px 20px 56px; }
+button, input { font: inherit; }
+:focus-visible { outline: 3px solid var(--gauge); outline-offset: 2px; }
+
+/* header */
+.top { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 28px; }
+.mark { font: 800 28px/1 var(--display); margin: 0; display: flex; align-items: center; gap: 10px; letter-spacing: -0.01em; }
+.leaf { width: 22px; height: 22px; background: var(--tile); clip-path: polygon(50% 0, 62% 30%, 95% 22%, 75% 52%, 100% 70%, 62% 70%, 55% 100%, 45% 100%, 38% 70%, 0 70%, 25% 52%, 5% 22%, 38% 30%); }
+.top-actions { display: flex; gap: 10px; }
+
+/* buttons: chunky like the game's, without copying its art */
+.btn { border: 2px solid var(--slate-700); background: var(--slate-800); color: var(--paper); padding: 9px 16px; border-radius: 9px; cursor: pointer; font-weight: 700; }
+.btn:hover { border-color: var(--muted); }
+.btn:disabled { opacity: .45; cursor: default; }
+.btn.primary { background: var(--tile); border-color: var(--tile-edge); color: #1d1206; box-shadow: inset 0 -3px 0 var(--tile-edge); }
+.btn.primary:hover { filter: brightness(1.06); }
+.btn.ghost { background: transparent; }
+.btn.small { padding: 6px 12px; font-size: 15px; }
+.btn.file { display: inline-flex; align-items: center; }
+
+/* the HUD: the page's one big moment, a large copy of the game's EXP bar */
+.hud { display: grid; grid-template-columns: auto 1fr; gap: 22px; align-items: center; background: var(--slate-800); border: 2px solid var(--slate-700); border-radius: 14px; padding: 22px 24px; }
+.lv { display: flex; align-items: center; gap: 12px; }
+.lv-label { font: 800 40px/1 var(--display); }
+.tiles { display: flex; gap: 3px; }
+.tile { display: grid; place-items: center; width: 38px; height: 46px; background: var(--tile); color: #fff; font: 800 32px/1 var(--display); border-radius: 6px; box-shadow: inset 0 -4px 0 var(--tile-edge); text-shadow: 0 2px 0 var(--tile-edge); }
+.gauge-row { display: flex; align-items: baseline; gap: 12px; margin-bottom: 8px; }
+.gauge-name { font: 800 22px/1 var(--display); }
+.gauge-pct { font-size: 18px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.gauge-pct.live { color: var(--paper); font-weight: 700; }
+.gauge { height: 26px; border-radius: 8px; background: #d8dde6; border: 2px solid #8e99aa; overflow: hidden; }
+.gauge-fill { height: 100%; width: 0; background: linear-gradient(var(--gauge) 55%, var(--gauge-deep)); transition: width .6s ease-out; }
+.eta { margin: 10px 0 0; color: var(--muted); }
+.eta.live { color: var(--paper); }
+
+/* prompts for the level / meso digits */
+.prompt { margin-top: 16px; background: var(--steel-200); color: #18202b; border-radius: 12px; padding: 16px 18px; }
+.prompt label { display: block; font-weight: 700; margin-bottom: 8px; max-width: 64ch; }
+.prompt-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.prompt input { width: 12ch; padding: 8px 10px; border: 2px solid #8e99aa; border-radius: 8px; font-variant-numeric: tabular-nums; }
+.prompt .btn.ghost { color: #18202b; border-color: #8e99aa; }
+.prompt-error { margin: 8px 0 0; color: #a32c12; min-height: 1em; }
+
+/* rates */
+.rates { display: grid; grid-template-columns: 1fr 1fr; gap: 0; margin-top: 28px; }
+.rate { padding: 4px 24px 4px 0; }
+.rate + .rate { padding-left: 24px; border-left: 2px solid var(--slate-700); }
+.rate h2 { font: 600 18px/1.2 var(--display); color: var(--muted); margin: 0 0 4px; display: flex; align-items: center; gap: 8px; }
+.big { font: 800 56px/1.05 var(--display); margin: 0; font-variant-numeric: tabular-nums; }
+.exp .big { color: var(--gauge); }
+.rate .big.pending { font-size: 26px; line-height: 2.15; color: var(--muted); font-weight: 600; }
+.meso .big { color: var(--gold); }
+.sub { margin: 2px 0 0; color: var(--muted); font-variant-numeric: tabular-nums; }
+.sub strong { color: var(--paper); }
+.coin { width: 16px; height: 16px; border-radius: 50%; background: radial-gradient(circle at 40% 35%, #ffe680, var(--gold) 55%, #b88a00); box-shadow: 0 0 0 2px #7a5a00; }
+
+/* session */
+.session { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 20px; margin-top: 30px; padding-top: 20px; border-top: 2px solid var(--slate-700); }
+.clock { margin: 0; font-size: 19px; font-variant-numeric: tabular-nums; display: flex; align-items: center; gap: 10px; }
+.dot { width: 10px; height: 10px; border-radius: 50%; background: #5d6878; display: inline-block; }
+.dot.on { background: var(--gauge); box-shadow: 0 0 0 4px rgba(198, 224, 27, .2); }
+.status { color: var(--muted); }
+.status.warn { color: var(--alert); }
+.events { margin: 0; color: var(--muted); flex: 1 1 200px; }
+.controls { display: flex; gap: 8px; }
+
+/* what it sees */
+.sees { margin-top: 30px; }
+.sees h2 { font: 600 18px/1.2 var(--display); color: var(--muted); margin: 0 0 10px; }
+.sees-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.sees figure { margin: 0; }
+.sees canvas { width: 100%; height: auto; max-height: 64px; object-fit: contain; image-rendering: pixelated; background: #11161e; border-radius: 8px; border: 2px solid var(--slate-700); }
+.sees figcaption { margin-top: 6px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.tools { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+
+.foot { margin-top: 40px; color: var(--muted); font-size: 15px; max-width: 70ch; }
+.foot strong { color: var(--paper); }
+
+/* pop-out window */
+body.pip { margin: 0; background: var(--slate-800); }
+.mini { padding: 12px 14px; font-size: 14px; }
+.mini-head { display: flex; align-items: center; gap: 8px; font-variant-numeric: tabular-nums; color: var(--muted); }
+.mini-lv { margin-left: auto; color: var(--paper); font-weight: 700; }
+.mini-gauge { height: 10px; border-radius: 4px; background: #d8dde6; overflow: hidden; margin: 8px 0 4px; }
+.mini-eta { margin: 0 0 6px; color: var(--muted); }
+.mini-num { margin: 0; font: 800 30px/1.1 var(--display); color: var(--gauge); font-variant-numeric: tabular-nums; }
+.mini-num.meso { color: var(--gold); margin-top: 6px; }
+.mini-num small { font: 400 13px var(--text); color: var(--muted); margin-left: 6px; }
+.mini-sub { margin: 0; color: var(--muted); }
+.mini .btn { margin-top: 10px; width: 100%; }
+
+@media (max-width: 640px) {
+  .hud { grid-template-columns: 1fr; }
+  .rates, .sees-grid { grid-template-columns: 1fr; }
+  .rate + .rate { padding-left: 0; border-left: 0; border-top: 2px solid var(--slate-700); padding-top: 16px; margin-top: 16px; }
+  .big { font-size: 44px; }
+}
+@media (prefers-reduced-motion: reduce) { .gauge-fill { transition: none; } }
