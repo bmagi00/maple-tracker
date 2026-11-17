@@ -1,0 +1,11 @@
+.buildenv/
+build/
+build_tess/
+dist/
+*.spec
+MapleTracker.zip
+__pycache__/
+tracker_config.json
+tracker.log
+sessions/
+debug/

@@ -1,0 +1,49 @@
+# Builds MapleTracker.exe on GitHub's Windows servers and publishes it as a
+# release. Runs whenever you change a file on the main branch, or on demand
+# from the Actions tab ("Build Windows app" > "Run workflow").
+name: Build Windows app
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to publish the release
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Tesseract
+        run: choco install tesseract -y --no-progress
+
+      - name: Build MapleTracker.zip
+        shell: cmd
+        run: build.bat
+
+      - name: Keep a copy of this build
+        uses: actions/upload-artifact@v4
+        with:
+          name: MapleTracker
+          path: MapleTracker.zip
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v1.0.${{ github.run_number }}"
+          gh release create "$TAG" MapleTracker.zip \
+            --target "${{ github.sha }}" \
+            --title "Maple Tracker $TAG" \
+            --notes "Download **MapleTracker.zip** below, unzip it, and double-click **MapleTracker.exe**. README.txt inside explains setup." \
+            --latest
