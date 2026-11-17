@@ -278,9 +278,14 @@ def parse_exp_text(text):
     return exp, pct
 
 
+LAST_OCR = {"exp": ""}   # raw text of the latest EXP read, for the readings log
+
+
 def read_exp(sct, cfg):
     img = grab(sct, cfg, cfg["regions"]["exp"], cfg["frames_per_read"])
-    return parse_exp_text(ocr(img, cfg, "exp"))
+    text = ocr(img, cfg, "exp")
+    LAST_OCR["exp"] = text.strip()
+    return parse_exp_text(text)
 
 
 def read_mesos(sct, cfg):
@@ -374,61 +379,168 @@ def selftest(out_path=None):
 # ------------------------------------------------------------------ trackers
 
 class ExpTracker:
-    """Turns noisy EXP readings into total EXP gained, handling level-ups."""
+    """Turns noisy EXP readings into total EXP gained, handling level-ups.
+
+    The key check: EXP divided by the percentage always gives the same total
+    for the current level. A reading where both numbers agree is almost
+    certainly correct, so it's accepted right away, even when EXP changes
+    every second. Anything that doesn't fit (a drop, a level-up, or a level
+    we can't verify yet) must show up in several readings in a row before it
+    counts, because a misread on a still frame tends to repeat."""
+
+    CONFIRM = 3          # readings in a row needed for drops / level-ups
+    REBASELINE = 20      # this many rejects in a row = start over
 
     def __init__(self):
         self.last = None        # (exp, pct) last accepted reading
-        self.pending = None     # reading waiting for confirmation
-        self.level_req = None   # EXP needed for the current level
+        self.req = None         # EXP needed for the current level (estimate)
+        self.req_pct = None     # the % that estimate came from
+        self.pending = []       # readings waiting for confirmation
         self.rejects = 0
         self.gained = 0
         self.lost = 0           # EXP lost to deaths
         self.levels = 0
+        self.undo = None        # state before the last level-up/death/rebaseline
 
-    def _plausible(self, exp, pct):
-        """EXP / percent should always give the same level requirement.
-        If it doesn't, a digit was probably misread."""
-        if self.level_req is None or pct < 2:
-            return True
-        if self.last and self.last[1] - pct > 30:   # looks like a level-up
-            return True
-        req = exp / (pct / 100)
-        return abs(req - self.level_req) / self.level_req < 0.03
+    def _snapshot(self):
+        return (self.last, self.req, self.req_pct, self.gained, self.lost, self.levels)
 
+    def _try_undo(self, reading):
+        """A real level-up or death never jumps straight back to the old
+        numbers. If the old level's numbers reappear before any new progress,
+        the 'event' was a misread repeated on a still frame: take it back."""
+        if not self.undo:
+            return False
+        last, req, req_pct = self.undo[:3]
+        exp, pct = reading
+        if last is None or exp < last[0] or pct < last[1] - 0.011:
+            return False
+        if not self._fits(exp, pct, req, req_pct):
+            return False
+        (self.last, self.req, self.req_pct,
+         self.gained, self.lost, self.levels) = self.undo
+        self.undo = None
+        self.pending = []
+        return True
+
+    # -- helpers
+    @staticmethod
+    def _req(exp, pct):
+        return exp / (pct / 100) if pct >= 0.5 else None
+
+    @staticmethod
+    def _tol(*pcts):
+        # The game shows % to 2 decimals, so it can be off by up to 0.005.
+        return sum(0.006 / p for p in pcts if p) + 0.001
+
+    def _fits(self, exp, pct, req, req_pct):
+        """True/False if the reading fits that level total, None if unknown."""
+        r = self._req(exp, pct)
+        if r is None or req is None:
+            return None
+        return abs(r - req) / req <= self._tol(pct, req_pct)
+
+    def _set_last(self, reading, new_level=False):
+        exp, pct = reading
+        self.last = reading
+        r = self._req(exp, pct)
+        if new_level:
+            self.req, self.req_pct = (r, pct) if r else (None, None)
+        elif r and (self.req is None or pct > (self.req_pct or 0)):
+            self.req, self.req_pct = r, pct   # higher % = more precise
+
+    def _agrees(self, a, b):
+        """Two readings in a row that could both be right: EXP and % didn't
+        go backwards, and they imply the same level total."""
+        (ea, pa), (eb, pb) = a, b
+        if eb < ea or pb < pa - 0.011:
+            return False
+        fit = self._fits(eb, pb, self._req(ea, pa), pa)
+        return fit is not False
+
+    # -- main entry point; returns a short label for the diagnostic log
     def update(self, reading):
         if reading is None:
-            return
-        # Debounce: only accept a value once it's been read twice in a row.
-        if reading != self.pending:
-            self.pending = reading
-            return
+            return "unreadable"
+        undone = self._try_undo(reading)
         exp, pct = reading
-        if not self._plausible(exp, pct):
-            self.rejects += 1
-            if self.rejects >= 10:   # consistently "wrong" = our baseline was bad
-                self.level_req = None
-                self.rejects = 0
-            return
-        self.rejects = 0
-
-        old_req = self.level_req
-        if pct >= 2:
-            self.level_req = exp / (pct / 100)
-
         if self.last is None:
-            self.last = reading
-            return
+            return self._pend(reading, "start")
         old_exp, old_pct = self.last
-        if exp > old_exp:
-            self.gained += exp - old_exp
-        elif exp < old_exp:
-            if old_pct - pct > 30:  # big drop in % = level up
-                req = old_req or (old_exp / (old_pct / 100) if old_pct else 0)
-                self.gained += max(0, req - old_exp) + exp
-                self.levels += 1
-            else:                    # small drop = died
-                self.lost += old_exp - exp
-        self.last = reading
+        if exp >= old_exp and pct >= old_pct - 0.011:
+            fit = self._fits(exp, pct, self.req, self.req_pct)
+            if fit:
+                self.pending = []
+                self.rejects = 0
+                self.gained += exp - old_exp
+                self._set_last(reading)
+                if exp > old_exp:
+                    self.undo = None   # real progress since the event: keep it
+                if undone:
+                    return "undo"
+                return "gain" if exp > old_exp else "same"
+            if fit is False:
+                return self._reject()
+            return self._pend(reading, "unverified")   # % too low to check yet
+        # Lower than before: death, level-up, or a misread.
+        if self._fits(exp, pct, self.req, self.req_pct) is False and \
+                not (old_pct - pct > 30 or pct < 0.5):
+            return self._reject()
+        return self._pend(reading, "drop")
+
+    def _reject(self):
+        self.pending = []
+        self.rejects += 1
+        if self.rejects >= self.REBASELINE:   # our baseline itself was wrong
+            self.undo = self.undo or self._snapshot()
+            self.last = self.req = self.req_pct = None
+            self.rejects = 0
+            return "rebaseline"
+        return "rejected"
+
+    def _pend(self, reading, why):
+        if self.pending and self._agrees(self.pending[-1], reading):
+            self.pending.append(reading)
+        else:
+            self.pending = [reading]
+        if len(self.pending) < self.CONFIRM:
+            return f"wait-{why}"
+        return self._resolve()
+
+    def _resolve(self):
+        first, latest = self.pending[0], self.pending[-1]
+        self.pending = []
+        self.rejects = 0
+        if self.last is None:
+            self._set_last(latest, new_level=True)
+            return "baseline"
+        old_exp, old_pct = self.last
+        f_exp = first[0]
+        l_exp, l_pct = latest
+        if l_exp >= old_exp and l_pct >= old_pct - 0.011:
+            self.gained += l_exp - old_exp     # verified by repetition
+            self._set_last(latest)
+            return "gain-confirmed"
+        fit = self._fits(l_exp, l_pct, self.req, self.req_pct)
+        if fit or (fit is None and old_pct - l_pct < 30):
+            self.undo = self._snapshot()
+            self.lost += max(0, old_exp - f_exp)          # died
+            self.gained += l_exp - f_exp
+            self._set_last(latest)
+            return "death"
+        new_req = self._req(l_exp, l_pct)
+        ratio = new_req / self.req if new_req and self.req else None
+        # Each level needs more EXP than the last, so the new total must grow.
+        if (ratio is not None and 1.0 < ratio <= 3.5) or \
+                (ratio is None and old_pct >= 70):
+            self.undo = self._snapshot()
+            if self.req:
+                self.gained += max(0, self.req - old_exp)  # rest of old level
+            self.gained += l_exp
+            self.levels += 1
+            self._set_last(latest, new_level=True)
+            return "level-up"
+        return "rejected-pattern"
 
 
 class MesoTotalTracker:
@@ -516,6 +628,11 @@ class Engine:
         SESSIONS_DIR.mkdir(exist_ok=True)
         self.log_path = SESSIONS_DIR / f"session_{datetime.now():%Y%m%d_%H%M%S}.csv"
         self._log_started = False
+        # Every EXP read (raw text + what the tracker decided), so a bad
+        # session can be diagnosed. About 150 KB per hour.
+        self.readings_path = SESSIONS_DIR / f"readings_{datetime.now():%Y%m%d_%H%M%S}.csv"
+        self._readings_file = None
+        self._readings_rows = 0
         threading.Thread(target=self._loop, daemon=True).start()
 
     # -- controls
@@ -558,6 +675,12 @@ class Engine:
     def shutdown(self):
         self.stop()
         self._alive = False
+        if self._readings_file:
+            try:
+                self._readings_file.close()
+            except OSError:
+                pass
+            self._readings_file = None
 
     # -- state
     def _elapsed(self):
@@ -622,7 +745,8 @@ class Engine:
                     if self.running:
                         if reading:
                             self.last_ok = time.time()
-                        self.exp.update(reading)
+                        decision = self.exp.update(reading)
+                        self._log_reading(reading, decision)
                         if self.meso:
                             self.meso.update(mesos)
                         if self.pick and lines is not None:
@@ -635,6 +759,25 @@ class Engine:
                     last_log = time.time()
                     self._log()
                 time.sleep(self.cfg["poll_seconds"])
+
+    def _log_reading(self, reading, decision):
+        try:
+            if self._readings_file is None:
+                self._readings_file = open(self.readings_path, "a", newline="",
+                                           encoding="utf-8")
+                csv.writer(self._readings_file).writerow(
+                    ["time", "ocr_text", "exp", "pct", "decision",
+                     "exp_gained_total", "level_ups"])
+            csv.writer(self._readings_file).writerow(
+                [datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                 LAST_OCR["exp"].replace("\n", " | "),
+                 reading[0] if reading else "", reading[1] if reading else "",
+                 decision, round(self.exp.gained), self.exp.levels])
+            self._readings_rows += 1
+            if self._readings_rows % 10 == 0:
+                self._readings_file.flush()
+        except OSError:
+            pass
 
     def _log(self):
         s = self.snapshot()

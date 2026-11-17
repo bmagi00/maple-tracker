@@ -1,5 +1,7 @@
 # Builds Maple Tracker for Windows and Mac on GitHub's servers, checks that
-# each packaged app can actually read text, and publishes both as a release.
+# each packaged app can actually read text, and publishes it.
+# Each platform publishes on its own as soon as it's ready, so a slow or
+# failed Mac build never holds up the Windows download (or the other way round).
 # Runs whenever a file on the main branch changes, or on demand from the
 # Actions tab ("Build apps" > "Run workflow").
 name: Build apps
@@ -11,6 +13,16 @@ on:
 
 permissions:
   contents: write   # needed to publish the release
+
+env:
+  TAG: v1.1.${{ github.run_number }}
+  NOTES: |
+    **Run this on a second device, not the PC you play on.**
+
+    - Windows: download **MapleTracker.zip**, unzip, double-click **MapleTracker.exe**.
+    - Mac (Apple Silicon): download **MapleTracker-mac.zip**, unzip, open the app.
+
+    README.txt inside each download explains setup.
 
 jobs:
   windows:
@@ -40,12 +52,15 @@ jobs:
           if (Test-Path $out) { Get-Content $out } else { Write-Host "No self-test output" }
           if ($p.ExitCode -ne 0) { exit 1 }
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: windows
-          path: MapleTracker.zip
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/publish.sh MapleTracker.zip
 
   mac:
+    # Paused for now. Change `false` to `true` to build the Mac version again.
+    if: ${{ false }}
     runs-on: macos-latest   # Apple Silicon
     steps:
       - name: Get the code
@@ -67,36 +82,7 @@ jobs:
           cat selftest-mac.txt 2>/dev/null || echo "No self-test output"
           exit $code
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: mac
-          path: MapleTracker-mac.zip
-
-  release:
-    needs: [windows, mac]
-    # Publish whatever built successfully, so a Mac problem never blocks
-    # the Windows download (or the other way round).
-    if: ${{ !cancelled() && (needs.windows.result == 'success' || needs.mac.result == 'success') }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-
-      - name: Publish release
+      - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          files=()
-          [ -f windows/MapleTracker.zip ] && files+=(windows/MapleTracker.zip)
-          [ -f mac/MapleTracker-mac.zip ] && files+=(mac/MapleTracker-mac.zip)
-          TAG="v1.1.${{ github.run_number }}"
-          gh release create "$TAG" "${files[@]}" \
-            --repo "${{ github.repository }}" \
-            --target "${{ github.sha }}" \
-            --title "Maple Tracker $TAG" \
-            --notes "**Run this on a second device, not the PC you play on.**
-
-          - Windows: download **MapleTracker.zip**, unzip, double-click **MapleTracker.exe**.
-          - Mac (Apple Silicon): download **MapleTracker-mac.zip**, unzip, open the app.
-
-          README.txt inside each download explains setup." \
-            --latest
+        run: bash .github/publish.sh MapleTracker-mac.zip
