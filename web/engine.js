@@ -823,6 +823,7 @@ export const ACCEPTED = new Set(["gain", "same", "gain-confirmed", "jump-confirm
 /** Ties it together: finds the HUD in frames, reads it, feeds a tracker.
  *  The page calls tick(now, getFrame) on a timer. */
 export class Session {
+  static RATE_STEP = 15;   // seconds
   constructor(reader, { level = null, onLevel = () => {}, mesoReader = null } = {}) {
     this.reader = reader; this.onLevel = onLevel; this.startLevel = level;
     this.mesoReader = mesoReader;
@@ -832,6 +833,7 @@ export class Session {
     this.reset();
   }
   reset() {
+    this.resetCount = (this.resetCount || 0) + 1;
     this.meso = new MesoTracker();
     this.exp = new ExpTracker(); this.pct = new PctTracker(this.startLevel);
     this.mode = null; this.votes = []; this.history = [];
@@ -940,6 +942,21 @@ export class Session {
     this.mesoBox = box; this.mesoOk = Date.now();
     return null;
   }
+  /** EXP, % and mesos per hour at elapsed time `el` (seconds). */
+  computeRates(el, g) {
+    const span = Session.RATE_STEP * Math.floor(el / Session.RATE_STEP);
+    if (span < Session.RATE_STEP) return { expHr: null, nowHr: null, pctHr: null, mesoHr: null };
+    const hrs = el / 3600;
+    const expHr = g !== null ? g / hrs : null;
+    let nowHr = null;   // recent pace: the last 5 minutes (or all of it, if shorter)
+    if (g !== null && this.history.length && el >= 2 * Session.RATE_STEP) {
+      const old = this.history.find(h => el - h[0] <= 300);
+      if (old && el - old[0] >= Session.RATE_STEP) nowHr = (g - old[1]) / ((el - old[0]) / 3600);
+    }
+    const pctHr = this.mode === "pct" ? this.pct.pctGained / hrs : null;
+    const mesoHr = this.mesoSeen ? this.meso.gained / hrs : null;
+    return { expHr, nowHr, pctHr, mesoHr };
+  }
   feed(parsed) {
     if (parsed && this.mode === null) {
       this.votes.push(parsed[0] !== null ? "amount" : "pct");
@@ -957,17 +974,16 @@ export class Session {
     return "unreadable";
   }
   snapshot(now = Date.now()) {
-    const el = this.elapsed(now), hrs = el / 3600, settled = el >= 60, g = this.gained();
+    const el = this.elapsed(now), g = this.gained();
+    // Per-hour rates start after 15 seconds and are recalculated every 15
+    // seconds, so they move in steady steps instead of on every reading.
+    const step = Math.floor(el / Session.RATE_STEP);
+    if (!this.rates || this.rates.step !== step || this.rates.reset !== this.resetCount)
+      this.rates = { step, reset: this.resetCount, ...this.computeRates(el, g) };
+    const { expHr, nowHr, pctHr, mesoHr } = this.rates;
     let level = null, pct = null;
     if (this.mode === "amount" && this.exp.last) { level = levelFromAmount(...this.exp.last); pct = this.exp.last[1]; }
     if (this.mode === "pct" && this.pct.last !== null) { level = this.pct.level; pct = this.pct.last; }
-    const expHr = settled && g !== null ? g / hrs : null;
-    let nowHr = null;
-    if (g !== null && this.history.length) {
-      const old = this.history.find(h => el - h[0] <= 300);
-      if (old && el - old[0] >= 60) nowHr = (g - old[1]) / ((el - old[0]) / 3600);
-    }
-    const pctHr = this.mode === "pct" && settled ? this.pct.pctGained / hrs : null;
     let eta = null;
     const req = level ? expToNext(level) : null, rate = nowHr || expHr;
     if (req && pct !== null && rate > 0) eta = (100 - pct) / 100 * req / rate * 3600;
@@ -975,7 +991,7 @@ export class Session {
     const mesos = this.mesoSeen ? this.meso.gained : null;
     const mesoVisible = !!this.mesoBox && now - this.mesoOk < 6000;
     return {
-      mesos, mesoHr: settled && mesos !== null ? mesos / hrs : null, mesoTotal: this.meso.last,
+      mesos, mesoHr, mesoTotal: this.meso.last,
       mesoSpent: this.meso.spent, mesoVisible, mesoTracking: !!this.mesoReader,
       mesoNeedsTeach: !!this.mesoUnreadable && !mesoVisible,
       running: !!this.running, status: this.status, elapsed: el, mode: this.mode,
