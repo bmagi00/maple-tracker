@@ -24,7 +24,7 @@ GETTING STARTED (WINDOWS)
 2. Double-click MapleTracker.exe.
    Windows may say "Windows protected your PC" because the app isn't
    signed by a company. Click "More info", then "Run anyway".
-3. Continue with "Calibrate" below.
+3. Continue with "Start tracking" below.
 
 
 GETTING STARTED (MAC - Apple Silicon, M1 or newer)
@@ -39,22 +39,30 @@ GETTING STARTED (MAC - Apple Silicon, M1 or newer)
    System Settings > Privacy & Security > Screen & System Audio Recording
    (Screen Recording on older macOS), turn on MapleTracker, then quit
    and reopen it.
-4. Continue with "Calibrate" below.
+4. Continue with "Start tracking" below.
 
 
-CALIBRATE
----------
-1. Put the Discord stream on screen, fullscreen, and click Calibrate in
-   the tracker window. Move your mouse onto that screen.
-2. After a 5-second countdown you'll see a screenshot. Drag boxes around:
-     - the EXP numbers on the bottom bar, e.g. 12345[12.34%]  (needed)
-     - the meso total in your inventory window                 (optional)
-     - the area where "You have gained..." messages show up    (optional)
-   Draw each box tightly around the text, then press Enter (or Confirm).
-3. The app then shows what it read. The numbers should match the game.
-   If not, open the menu (gear icon) > Calibrate and try tighter boxes.
-4. Click Start and go grind. Drag the tracker window anywhere, as long
-   as it isn't covering one of the boxes you drew.
+START TRACKING
+--------------
+1. Put the stream on screen (fullscreen is best) so the game's bottom bar
+   is visible: LV, HP, MP and EXP. No setup or boxes needed.
+2. Click Start. The tracker finds the bar by itself (look for "Lv ..
+   ..%" under EXP / HR). If the stream window moves, it finds it again.
+3. If your HUD only shows a percentage, like EXP. [65.99%], it asks for
+   your level once. It turns % into EXP with the official EXP table and
+   counts level-ups from there. If it ever gets out of sync, use
+   menu > Set my level.
+4. Optional: menu > Check reading shows exactly what it read. It should
+   match the game.
+
+The tracker reads the game's digits by comparing them with examples of
+the HUD font, and keeps learning from your stream, so it gets more sure
+of itself over the first few minutes. If it isn't sure about a digit it
+skips that reading instead of guessing.
+
+ADVANCED: menu > Draw boxes myself lets you mark the meso total and
+pickup messages (optional), or the EXP numbers if automatic finding
+doesn't work for your layout.
 
 
 WATCHING THE DISCORD STREAM
@@ -81,10 +89,11 @@ on the network. Allow it (on Windows: Private networks).
 GOOD TO KNOW
 ------------
 - Per-hour numbers show up after the first minute.
-- Calibrate again if you change game resolution, stream quality or
-  monitors.
+- Per-hour shows the whole session; "now" is your pace over the last
+  5 minutes. "Next level in" uses that pace.
 - Menu: click the gear icon, or right-click the tracker (Control-click on
-  Mac): Calibrate, Check reading, Open data folder, Quit.
+  Mac): Check reading, Find the HUD again, Set my level, Draw boxes
+  myself, Open data folder, Quit.
 - Settings, session logs (sessions folder) and tracker.log are saved:
     Windows: next to MapleTracker.exe (or %APPDATA%\MapleTracker)
     Mac:     ~/Library/Application Support/MapleTracker

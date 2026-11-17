@@ -1,7 +1,8 @@
 # Maple Tracker
 
 EXP, mesos and items per hour for MapleStory Classic. It reads the numbers
-off a Discord stream of the game and never touches the game itself.
+off a stream of the game (Discord, YouTube, Twitch) and never touches the game
+itself. Shows EXP/hour, your recent pace, level, % and time to next level.
 
 > [!WARNING]
 > **Run this on a second device, not the PC you play on.** Nexon's rules can
@@ -24,9 +25,12 @@ protected your PC", click **More info**, then **Run anyway**.
 **System Settings > Privacy & Security** and click **Open Anyway**. Then allow
 it under **Screen & System Audio Recording** and reopen it.
 
-Then: put the Discord stream on screen fullscreen, click **Calibrate**, drag
-boxes around the EXP numbers (optionally the meso total and pickup messages),
-and click **Start**. `README.txt` inside the download has the full guide.
+Then put the stream on screen with the game's bottom bar visible and click
+**Start**. There's nothing to calibrate: it finds the HUD by itself, reads the
+EXP numbers, and finds them again if the window moves. If your HUD shows only a
+percentage (like `EXP. [65.99%]`), it asks for your level once and converts %
+to EXP with the official EXP table. `README.txt` inside the download has the
+full guide.
 
 You can watch your stats on the gaming PC too: open the web address shown at
 the bottom of the tracker in a browser.
