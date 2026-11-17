@@ -53,7 +53,7 @@ function hsv(r, g, b) {
 }
 
 /** Connected components of a 0/1 mask: [{x, y, w, h, area}]. */
-function components(mask, w, h) {
+function components(mask, w, h, diagonal = false) {
   const seen = new Uint8Array(w * h), out = [], stack = new Int32Array(w * h);
   for (let i = 0; i < w * h; i++) {
     if (!mask[i] || seen[i]) continue;
@@ -67,6 +67,12 @@ function components(mask, w, h) {
       if (px < w - 1 && mask[p + 1] && !seen[p + 1]) { seen[p + 1] = 1; stack[sp++] = p + 1; }
       if (py > 0 && mask[p - w] && !seen[p - w]) { seen[p - w] = 1; stack[sp++] = p - w; }
       if (py < h - 1 && mask[p + w] && !seen[p + w]) { seen[p + w] = 1; stack[sp++] = p + w; }
+      // Diagonal neighbours too: the game's own 1-pixel digits join at corners.
+      if (!diagonal) continue;
+      if (px > 0 && py > 0 && mask[p - w - 1] && !seen[p - w - 1]) { seen[p - w - 1] = 1; stack[sp++] = p - w - 1; }
+      if (px < w - 1 && py > 0 && mask[p - w + 1] && !seen[p - w + 1]) { seen[p - w + 1] = 1; stack[sp++] = p - w + 1; }
+      if (px > 0 && py < h - 1 && mask[p + w - 1] && !seen[p + w - 1]) { seen[p + w - 1] = 1; stack[sp++] = p + w - 1; }
+      if (px < w - 1 && py < h - 1 && mask[p + w + 1] && !seen[p + w + 1]) { seen[p + w + 1] = 1; stack[sp++] = p + w + 1; }
     }
     out.push({ x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1, area });
   }
@@ -173,7 +179,7 @@ export function lvLabelScore(img, [x, y, w, h]) {
 
 /** Find the EXP readout on the bar right of the level tiles, by looking
  *  for a '%' sign among digit-sized shapes. */
-export function locateReadout(img, run, reader) {
+export function locateReadout(img, run, reader, diagonal = false) {
   const [x, y, w, th] = run;
   const y0 = Math.max(0, Math.floor(y - 1.2 * th)), y1 = Math.min(img.h, Math.floor(y + 1.1 * th));
   const x0 = x + w, x1 = Math.min(img.w, Math.round(x0 + 60 * th));   // the HUD bar only
@@ -186,7 +192,7 @@ export function locateReadout(img, run, reader) {
   // A fairly low cut keeps thin, blurry strokes in one piece.
   for (let i = 0; i < n; i++) mask[i] = (g[i] - lo) / Math.max(8, hi - lo) > 0.35 ? 1 : 0;
   const dh = 0.55 * th;   // HUD digits are about half the tile height
-  const glyphs = components(mask, band.w, band.h)
+  const glyphs = components(mask, band.w, band.h, diagonal)
     .filter(c => c.h >= 0.6 * dh && c.h <= 1.6 * dh && c.w <= 2.2 * dh && c.w >= 0.15 * dh)
     .sort((a, b) => a.x - b.x);
   // Group into words on the same text line (commas/points stay inside).
@@ -250,12 +256,16 @@ export function findHud(img, reader, why = {}) {
                        lvTiles: scored.filter(s => s[0] > 0).length, tried: [] });
   for (const [score, run] of scored.slice(0, 4)) {
     if (score <= 0) break;
-    const box = locateReadout(img, run, reader);
-    // Only accept a spot whose numbers actually read as an EXP readout,
-    // so look-alikes elsewhere on screen are skipped.
-    const text = box ? reader.read(crop(img, ...box)).text : null;
-    why.tried.push({ tiles: run, box, text });
-    if (box && parseHudText(text)) return { tiles: run, exp: box };
+    // Stream video: blurry digits, pieces touch at edges. The game window
+    // itself: crisp 1-pixel digits whose strokes only meet at corners.
+    for (const diagonal of [false, true]) {
+      const box = locateReadout(img, run, reader, diagonal);
+      // Only accept a spot whose numbers actually read as an EXP readout,
+      // so look-alikes elsewhere on screen are skipped.
+      const text = box ? reader.read(crop(img, ...box)).text : null;
+      why.tried.push({ tiles: run, box, text });
+      if (box && parseHudText(text)) return { tiles: run, exp: box };
+    }
   }
   return null;
 }
