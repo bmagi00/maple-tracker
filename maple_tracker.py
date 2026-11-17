@@ -6,8 +6,13 @@ on a second PC) and never touches the game itself. Everything happens in a
 small floating window: Calibrate, Check reading, Start/Pause, Reset.
 The same stats are served as a web page other devices on the network can open.
 
+Run it on a SECOND device, never on the PC you play on.
+
 Run from source:  python maple_tracker.py
-Build the .exe:   double-click build.bat (Windows)
+Self-test OCR:    python maple_tracker.py --selftest [result.txt]
+Build Windows:    double-click build.bat
+Build Mac:        bash build_mac.sh
+Text reading uses Tesseract on Windows and Apple's built-in Vision on Mac.
 """
 
 import base64
@@ -20,6 +25,7 @@ import os
 import re
 import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -35,10 +41,12 @@ import numpy as np
 import pytesseract
 
 APP_NAME = "Maple Tracker"
+IS_WIN = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
 
 # Use real pixel coordinates on scaled (125%/150%) Windows displays, so the
 # screenshot, the calibration boxes and the floating window all agree.
-if sys.platform == "win32":
+if IS_WIN:
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
     except Exception:
@@ -52,7 +60,13 @@ if sys.platform == "win32":
 
 def _data_dir():
     """Where settings and logs live: next to the .exe if that folder is
-    writable, otherwise %APPDATA%\\MapleTracker. From source: current folder."""
+    writable, otherwise %APPDATA%\\MapleTracker. On Mac the app bundle is
+    read-only, so ~/Library/Application Support/MapleTracker.
+    From source: current folder."""
+    if getattr(sys, "frozen", False) and IS_MAC:
+        d = Path.home() / "Library" / "Application Support" / "MapleTracker"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
     if getattr(sys, "frozen", False):
         d = Path(sys.executable).resolve().parent
         try:
@@ -97,10 +111,13 @@ DEFAULT_CONFIG = {
 }
 
 
+OCR_BACKEND = "tesseract"   # "vision" on Mac; set by load_config()
+
+
 def find_tesseract(cfg):
     """Bundled copy (inside the .exe folder) first, then the usual installs."""
     base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-    candidates = [base / "tesseract" / "tesseract.exe"]
+    candidates = [base / "tesseract" / ("tesseract.exe" if IS_WIN else "tesseract")]
     if cfg.get("tesseract_cmd"):
         candidates.append(Path(cfg["tesseract_cmd"]))
     candidates += [Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe"),
@@ -120,10 +137,18 @@ def load_config():
             cfg.update(json.loads(CONFIG_FILE.read_text()))
         except Exception:
             log.exception("Bad config file, using defaults")
-    tess = find_tesseract(cfg)
+    global OCR_BACKEND
+    OCR_BACKEND = "tesseract"
+    if IS_MAC:
+        try:
+            import Vision  # noqa: F401  (Apple's built-in text recognition)
+            OCR_BACKEND = "vision"
+        except Exception:
+            log.warning("Apple Vision unavailable, falling back to Tesseract")
+    tess = find_tesseract(cfg) if OCR_BACKEND == "tesseract" else None
     if tess:
         pytesseract.pytesseract.tesseract_cmd = tess
-    cfg["_tesseract_found"] = bool(tess)
+    cfg["_tesseract_found"] = OCR_BACKEND == "vision" or bool(tess)
     return cfg
 
 
@@ -169,8 +194,48 @@ def preprocess(img, cfg):
     return cv2.copyMakeBorder(th, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=255)
 
 
-def ocr(img, cfg, tess_config):
-    return pytesseract.image_to_string(preprocess(img, cfg), config=tess_config)
+TESS_CONFIGS = {
+    "exp": "--psm 7 -c tessedit_char_whitelist=0123456789,.[]%",
+    "digits": "--psm 7 -c tessedit_char_whitelist=0123456789,",
+    "lines": "--psm 6",
+}
+# Vision has no character whitelist, so fix the usual letter/digit mix-ups
+# in number-only boxes.
+DIGIT_FIX = str.maketrans({"O": "0", "o": "0", "D": "0", "l": "1", "I": "1",
+                           "|": "1", "i": "1", "S": "5", "s": "5", "B": "8"})
+
+
+def _vision_lines(img):
+    """Apple's built-in text recognition (macOS 10.15+). Returns lines
+    top to bottom."""
+    import Vision
+    from Foundation import NSData
+    ok, buf = cv2.imencode(".png", img)
+    data = NSData.dataWithBytes_length_(buf.tobytes(), int(buf.size))
+    handler = Vision.VNImageRequestHandler.alloc().initWithData_options_(data, None)
+    req = Vision.VNRecognizeTextRequest.alloc().init()
+    req.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
+    req.setUsesLanguageCorrection_(False)
+    success, err = handler.performRequests_error_([req], None)
+    if not success:
+        raise RuntimeError(f"Vision text recognition failed: {err}")
+    rows = []
+    for obs in req.results() or []:
+        cands = obs.topCandidates_(1)
+        if cands and len(cands):
+            box = obs.boundingBox()  # origin is bottom-left, 0..1
+            rows.append((-box.origin.y, box.origin.x, str(cands[0].string())))
+    rows.sort()
+    return [r[2] for r in rows]
+
+
+def ocr(img, cfg, mode):
+    """mode: 'exp' (12345[12.34%]), 'digits' (1,234,567) or 'lines' (free text)."""
+    pre = preprocess(img, cfg)
+    if OCR_BACKEND == "vision":
+        text = "\n".join(_vision_lines(pre))
+        return text if mode == "lines" else text.translate(DIGIT_FIX)
+    return pytesseract.image_to_string(pre, config=TESS_CONFIGS[mode])
 
 
 def to_int(s):
@@ -203,10 +268,8 @@ def lan_ip():
 EXP_RE = re.compile(r"([\d][\d,]*)\s*\[?\s*(\d{1,3}(?:\.\d+)?)\s*%")
 
 
-def read_exp(sct, cfg):
-    img = grab(sct, cfg, cfg["regions"]["exp"], cfg["frames_per_read"])
-    text = ocr(img, cfg, "--psm 7 -c tessedit_char_whitelist=0123456789,.[]%")
-    m = EXP_RE.search(text.replace(" ", ""))
+def parse_exp_text(text):
+    m = EXP_RE.search(re.sub(r"\s+", "", text))
     if not m:
         return None
     exp, pct = to_int(m.group(1)), float(m.group(2))
@@ -215,16 +278,20 @@ def read_exp(sct, cfg):
     return exp, pct
 
 
+def read_exp(sct, cfg):
+    img = grab(sct, cfg, cfg["regions"]["exp"], cfg["frames_per_read"])
+    return parse_exp_text(ocr(img, cfg, "exp"))
+
+
 def read_mesos(sct, cfg):
     img = grab(sct, cfg, cfg["regions"]["mesos"], cfg["frames_per_read"])
-    text = ocr(img, cfg, "--psm 7 -c tessedit_char_whitelist=0123456789,")
-    return to_int(text)
+    return to_int(ocr(img, cfg, "digits"))
 
 
 def read_pickup_lines(sct, cfg):
     # Single frame: pickup messages move, so blending frames would smear them.
     img = grab(sct, cfg, cfg["regions"]["pickups"], 1)
-    text = ocr(img, cfg, "--psm 6")
+    text = ocr(img, cfg, "lines")
     lines = []
     for raw in text.splitlines():
         line = re.sub(r"\s+", " ", raw).strip().lower()
@@ -255,6 +322,53 @@ def check_reading(cfg):
     out.append("\nThese should match the game exactly. If not, Calibrate again "
                "with tighter boxes around just the numbers.")
     return "\n".join(out)
+
+
+def _render_text(text, light_on_dark=True, scale=0.6):
+    """Draw small UI-style text, roughly like the game's status bar."""
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (w, h), base = cv2.getTextSize(text, font, scale, 1)
+    bg, fg = ((40, 30, 25), (235, 235, 235)) if light_on_dark else ((235, 235, 235), (30, 30, 30))
+    img = np.full((h + base + 10, w + 12, 3), bg, np.uint8)
+    cv2.putText(img, text, (6, h + 5), font, scale, fg, 1, cv2.LINE_AA)
+    return img
+
+
+def selftest(out_path=None):
+    """Reads a few rendered samples with the real text reader. Used by the
+    automatic builds to prove the packaged app can read text."""
+    cfg = load_config()
+    cases = [
+        ("exp", "12,345[61.72%]", lambda t: parse_exp_text(t) == (12345, 61.72)),
+        ("digits", "1,234,567", lambda t: to_int(t) == 1234567),
+        ("lines", "You have gained mesos (+77)",
+         lambda t: re.search(PickupTracker(cfg["meso_pattern"], cfg["item_pattern"])
+                             .meso_re, t.lower()) is not None and "77" in t),
+    ]
+    report = [f"{APP_NAME} self-test  |  platform={sys.platform}  backend={OCR_BACKEND}"
+              f"  frozen={bool(getattr(sys, 'frozen', False))}"]
+    passed = True
+    if not cfg["_tesseract_found"]:
+        report.append("FAIL  text reader not found")
+        passed = False
+    else:
+        for light_on_dark in (True, False):
+            for mode, text, check in cases:
+                try:
+                    got = ocr(_render_text(text, light_on_dark), cfg, mode).strip()
+                    ok = check(got)
+                except Exception as e:
+                    got, ok = f"error: {e}", False
+                passed &= ok
+                style = "light-on-dark" if light_on_dark else "dark-on-light"
+                report.append(f"{'PASS' if ok else 'FAIL'}  {mode:<6} {style:<13} "
+                              f"expected {text!r}  read {got!r}")
+    report.append("RESULT: " + ("PASS" if passed else "FAIL"))
+    text = "\n".join(report)
+    log.info("\n%s", text)
+    if out_path:
+        Path(out_path).write_text(text + "\n", encoding="utf-8")
+    return 0 if passed else 1
 
 
 # ------------------------------------------------------------------ trackers
@@ -557,8 +671,9 @@ class App:
                             "MapleTracker folder, or install Tesseract.")
             return s
         if not self.engine:
-            return blank_snapshot("Not set up yet. Put the game or stream on "
-                                  "screen and press Calibrate.")
+            return blank_snapshot("Not set up yet. Use this on a second device, "
+                                  "not the PC you play on. Put the Discord "
+                                  "stream on screen and press Calibrate.")
         return self.engine.snapshot()
 
     def start(self):
@@ -702,7 +817,10 @@ def start_web_server(app, port):
 
 BG, FG, SUB, DIM = "#1b1d23", "#e8e8e8", "#b8bcc4", "#8a8f98"
 ACCENT, GOOD, BAD, BTN, BTN_HOVER = "#f5a623", "#2ecc71", "#ff6b5b", "#2a2d35", "#353944"
-FONT, MONO = "Segoe UI", "Consolas"
+if IS_MAC:
+    FONT, MONO = "Helvetica Neue", "Menlo"
+else:
+    FONT, MONO = "Segoe UI", "Consolas"
 
 
 def flat_button(tk, parent, text, cmd, **kw):
@@ -778,6 +896,10 @@ class Calibrator:
                     break
             m = self.mon = mons[self.mon_idx]
             shot = np.ascontiguousarray(np.array(sct.grab(m))[:, :, :3])
+        # Retina Macs capture at 2x the screen's point size. Show the picture
+        # at point size so box coordinates match what grab() expects.
+        if shot.shape[1] != m["width"] or shot.shape[0] != m["height"]:
+            shot = cv2.resize(shot, (m["width"], m["height"]), interpolation=cv2.INTER_AREA)
         ok, buf = cv2.imencode(".png", shot)
         self.photo = tk.PhotoImage(data=base64.b64encode(buf.tobytes()).decode("ascii"))
 
@@ -953,7 +1075,9 @@ class Overlay:
         self._drag_from = None
         r.bind_all("<ButtonPress-1>", self._press, add="+")
         r.bind_all("<B1-Motion>", self._drag, add="+")
-        r.bind_all("<Button-3>", self.show_menu, add="+")
+        # Right-click: Button-3 on Windows, Button-2 / Control-click on Mac.
+        for seq in (("<Button-2>", "<Control-Button-1>") if IS_MAC else ("<Button-3>",)):
+            r.bind_all(seq, self.show_menu, add="+")
         self._mon_cache = None
         self.refresh()
 
@@ -1045,7 +1169,10 @@ class Overlay:
 
     def open_folder(self):
         try:
-            os.startfile(str(DATA_DIR))  # Windows only
+            if IS_WIN:
+                os.startfile(str(DATA_DIR))
+            else:
+                subprocess.Popen(["open" if IS_MAC else "xdg-open", str(DATA_DIR)])
         except Exception:
             self.messagebox.showinfo(APP_NAME, str(DATA_DIR), parent=self.root)
 
@@ -1117,12 +1244,40 @@ class Overlay:
 
 # --------------------------------------------------------------------- main
 
+def mac_check_screen_permission(overlay):
+    """macOS only lets apps see other windows after you allow Screen
+    Recording. Without it, screenshots show just the desktop wallpaper."""
+    try:
+        import Quartz
+        if Quartz.CGPreflightScreenCaptureAccess():
+            return
+        Quartz.CGRequestScreenCaptureAccess()  # adds the app to the list
+    except Exception:
+        log.exception("couldn't check Screen Recording permission")
+        return
+    overlay.messagebox.showinfo(
+        APP_NAME,
+        "Maple Tracker needs permission to read your screen.\n\n"
+        "1. Open System Settings > Privacy & Security > Screen & System "
+        "Audio Recording (called Screen Recording on older macOS).\n"
+        "2. Turn on Maple Tracker.\n"
+        "3. Quit and reopen Maple Tracker.",
+        parent=overlay.root)
+
+
 def main():
+    if "--selftest" in sys.argv:
+        i = sys.argv.index("--selftest")
+        out = sys.argv[i + 1] if len(sys.argv) > i + 1 else None
+        sys.exit(selftest(out))
     log.info("%s starting (data folder: %s)", APP_NAME, DATA_DIR)
     try:
         app = App()
         url = start_web_server(app, app.cfg["web_port"])
-        Overlay(app, url).mainloop()
+        overlay = Overlay(app, url)
+        if IS_MAC:
+            overlay.root.after(600, mac_check_screen_permission, overlay)
+        overlay.mainloop()
         app.stop()
     except Exception:
         log.exception("crashed")

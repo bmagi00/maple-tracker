@@ -1,23 +1,39 @@
 # Maple Tracker
 
 EXP, mesos and items per hour for MapleStory Classic. It reads the numbers
-off your screen (or a Discord stream of the game on a second PC) and never
-touches the game itself.
+off a Discord stream of the game and never touches the game itself.
+
+> [!WARNING]
+> **Run this on a second device, not the PC you play on.** Nexon's rules can
+> treat screen-reading programs running alongside the game as unauthorized
+> third-party programs, even ones that never touch the game. Your gaming PC
+> should run only MapleStory and Discord. A second PC, laptop or Mac watches
+> your Discord stream and runs Maple Tracker.
 
 ## Download
 
-**[Download MapleTracker.zip](../../releases/latest/download/MapleTracker.zip)**
+| | |
+|---|---|
+| **Windows** | **[MapleTracker.zip](../../releases/latest/download/MapleTracker.zip)** |
+| **Mac** (Apple Silicon, M1 or newer) | **[MapleTracker-mac.zip](../../releases/latest/download/MapleTracker-mac.zip)** |
 
-1. Unzip it and double-click `MapleTracker.exe`. Nothing else to install.
-2. If Windows says "Windows protected your PC", click **More info**, then **Run anyway**.
-   (The app isn't signed by a company.)
-3. Click **Calibrate**, drag boxes around the EXP numbers (and optionally the
-   meso total and pickup messages), then click **Start**.
+**Windows:** unzip, double-click `MapleTracker.exe`. If Windows says "Windows
+protected your PC", click **More info**, then **Run anyway**.
 
-`README.txt` inside the zip has the full guide, including the second-PC Discord setup.
+**Mac:** unzip and open the app. When macOS says it can't verify it, go to
+**System Settings > Privacy & Security** and click **Open Anyway**. Then allow
+it under **Screen & System Audio Recording** and reopen it.
+
+Then: put the Discord stream on screen fullscreen, click **Calibrate**, drag
+boxes around the EXP numbers (optionally the meso total and pickup messages),
+and click **Start**. `README.txt` inside the download has the full guide.
+
+You can watch your stats on the gaming PC too: open the web address shown at
+the bottom of the tracker in a browser.
 
 ## How it's built
 
 Every change to this repository is built automatically on GitHub's Windows
-servers (see the **Actions** tab), and the result is published under
-**Releases**. The download link above always points to the newest build.
+and Mac servers (see the **Actions** tab). Each build runs a self-test that
+proves the packaged app can read text before it's published under
+**Releases**. The download links above always point to the newest build.
