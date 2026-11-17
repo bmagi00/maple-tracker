@@ -823,7 +823,7 @@ export const ACCEPTED = new Set(["gain", "same", "gain-confirmed", "jump-confirm
 /** Ties it together: finds the HUD in frames, reads it, feeds a tracker.
  *  The page calls tick(now, getFrame) on a timer. */
 export class Session {
-  static RATE_STEP = 15;   // seconds
+  static RATE_START = 15;   // seconds before the first per-hour estimate
   constructor(reader, { level = null, onLevel = () => {}, mesoReader = null } = {}) {
     this.reader = reader; this.onLevel = onLevel; this.startLevel = level;
     this.mesoReader = mesoReader;
@@ -944,14 +944,13 @@ export class Session {
   }
   /** EXP, % and mesos per hour at elapsed time `el` (seconds). */
   computeRates(el, g) {
-    const span = Session.RATE_STEP * Math.floor(el / Session.RATE_STEP);
-    if (span < Session.RATE_STEP) return { expHr: null, nowHr: null, pctHr: null, mesoHr: null };
+    if (el < Session.RATE_START) return { expHr: null, nowHr: null, pctHr: null, mesoHr: null };
     const hrs = el / 3600;
     const expHr = g !== null ? g / hrs : null;
     let nowHr = null;   // recent pace: the last 5 minutes (or all of it, if shorter)
-    if (g !== null && this.history.length && el >= 2 * Session.RATE_STEP) {
+    if (g !== null && this.history.length && el >= 2 * Session.RATE_START) {
       const old = this.history.find(h => el - h[0] <= 300);
-      if (old && el - old[0] >= Session.RATE_STEP) nowHr = (g - old[1]) / ((el - old[0]) / 3600);
+      if (old && el - old[0] >= Session.RATE_START) nowHr = (g - old[1]) / ((el - old[0]) / 3600);
     }
     const pctHr = this.mode === "pct" ? this.pct.pctGained / hrs : null;
     const mesoHr = this.mesoSeen ? this.meso.gained / hrs : null;
@@ -975,9 +974,8 @@ export class Session {
   }
   snapshot(now = Date.now()) {
     const el = this.elapsed(now), g = this.gained();
-    // Per-hour rates start after 15 seconds and are recalculated every 15
-    // seconds, so they move in steady steps instead of on every reading.
-    const step = Math.floor(el / Session.RATE_STEP);
+    // Per-hour rates start after 15 seconds, then update once a second.
+    const step = el < Session.RATE_START ? -1 : Math.floor(el);
     if (!this.rates || this.rates.step !== step || this.rates.reset !== this.resetCount)
       this.rates = { step, reset: this.resetCount, ...this.computeRates(el, g) };
     const { expHr, nowHr, pctHr, mesoHr } = this.rates;
