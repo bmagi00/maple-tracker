@@ -118,3 +118,5 @@ body.pip { margin: 0; background: var(--slate-800); }
   .big { font-size: 44px; }
 }
 @media (prefers-reduced-motion: reduce) { .gauge-fill { transition: none; } }
+
+.offscreen { position: fixed; left: 0; top: 0; width: 2px; height: 2px; opacity: 0; pointer-events: none; }

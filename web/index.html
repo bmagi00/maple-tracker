@@ -87,7 +87,8 @@
   </footer>
 </main>
 
-<video id="video" muted playsinline hidden></video>
+<!-- Not display:none: some browsers (Firefox, Safari) stop updating hidden videos. -->
+<video id="video" class="offscreen" muted playsinline aria-hidden="true"></video>
 <canvas id="work" hidden></canvas>
 
 <template id="mini">
