@@ -179,7 +179,7 @@ export function lvLabelScore(img, [x, y, w, h]) {
 
 /** Find the EXP readout on the bar right of the level tiles, by looking
  *  for a '%' sign among digit-sized shapes. */
-export function locateReadout(img, run, reader, diagonal = false, thicken = 0) {
+export function locateReadout(img, run, reader, diagonal = false, thicken = 0, cut = 0.35, all = false) {
   const [x, y, w, th] = run;
   const y0 = Math.max(0, Math.floor(y - 1.2 * th)), y1 = Math.min(img.h, Math.floor(y + 1.1 * th));
   const x0 = x + w, x1 = Math.min(img.w, Math.round(x0 + 60 * th));   // the HUD bar only
@@ -190,7 +190,7 @@ export function locateReadout(img, run, reader, diagonal = false, thicken = 0) {
   const lo = percentileOfBytes(g, 50), hi = percentileOfBytes(g, 99.5);
   const mask = new Uint8Array(n);
   // A fairly low cut keeps thin, blurry strokes in one piece.
-  for (let i = 0; i < n; i++) mask[i] = (g[i] - lo) / Math.max(8, hi - lo) > 0.35 ? 1 : 0;
+  for (let i = 0; i < n; i++) mask[i] = (g[i] - lo) / Math.max(8, hi - lo) > cut ? 1 : 0;
   // A stretched picture (a small game filling a big or Retina screen) makes
   // thin grey strokes that fall apart into specks: thicken them so each
   // digit holds together.
@@ -225,7 +225,9 @@ export function locateReadout(img, run, reader, diagonal = false, thicken = 0) {
   }
   const medH = wd => { const hs = wd.items.map(c => c.h).sort((a, b) => a - b); return hs[hs.length >> 1]; };
   // Walk along the bar from the level tiles; the first word ending in '%'
-  // is the EXP readout (HP and MP end in ']' instead).
+  // is the EXP readout (HP and MP end in ']' instead). With `all`, give
+  // every candidate, so a look-alike (the character name) can be skipped.
+  const found = [];
   for (let i = 0; i < words.length; i++) {
     const wd = words[i];
     if (wd.items.length < 3) continue;
@@ -264,10 +266,12 @@ export function locateReadout(img, run, reader, diagonal = false, thicken = 0) {
     }
     // Little padding on the left: the bold 'EXP.' label is close by.
     const pl = 0.18 * th, pr = 0.4 * th, py = 0.3 * th;
-    return [Math.round(x0 + left - pl), Math.round(y0 + top - py),
-            Math.round(wd.x1 - left + pl + pr), Math.round(bot - top + 2 * py)];
+    const box = [Math.round(x0 + left - pl), Math.round(y0 + top - py),
+                 Math.round(wd.x1 - left + pl + pr), Math.round(bot - top + 2 * py)];
+    if (!all) return box;
+    found.push(box);
   }
-  return null;
+  return all ? found : null;
 }
 
 export function findHud(img, reader, why = {}) {
@@ -284,22 +288,33 @@ export function findHud(img, reader, why = {}) {
     // Stream video: blurry digits, pieces touch at edges. The game window
     // itself: crisp 1-pixel digits whose strokes only meet at corners.
     // Last: thickened strokes (stretched pictures), more for bigger HUDs.
-    const passes = [[false, 0], [true, 0], [false, 1], ...(run[3] >= 20 ? [[false, 2]] : [])];
-    for (const [diagonal, thicken] of passes) {
-      const box = locateReadout(img, run, reader, diagonal, thicken);
-      // Only accept a spot whose numbers actually read as an EXP readout,
-      // so look-alikes elsewhere on screen are skipped.
-      const text = box ? reader.read(crop(img, ...box)).text : null;
-      why.tried.push({ tiles: run, box, text });
-      const p = box && parseHudText(text);
-      if (!p) continue;
-      if (p[0] !== null) return { tiles: run, exp: box };
-      // Only the %: fine for a HUD that shows only the %, but keep looking
-      // for a reading with the EXP amount first.
-      pctOnly ||= { tiles: run, exp: box };
+    // Big, smoothly stretched HUDs (a Mac in full screen) have dim, soft
+    // grey text: a lower cut keeps the strokes of '%' together.
+    const passes = [[false, 0], [true, 0], [false, 1], ...(run[3] >= 20 ? [[false, 2], [false, 1, 0.22], [false, 0, 0.22], [false, 2, 0.22]] : [])];
+    for (const [diagonal, thicken, cut = 0.35] of passes) {
+      const boxes = locateReadout(img, run, reader, diagonal, thicken, cut, true);
+      if (!boxes.length) why.tried.push({ tiles: run, box: null, text: null });
+      for (const box of boxes.slice(0, 3)) {
+        // Only accept a spot whose numbers actually read as an EXP readout,
+        // so look-alikes elsewhere on screen are skipped.
+        const { rd, parsed: p } = readHud(reader, crop(img, ...box)), text = rd.text;
+        why.tried.push({ tiles: run, box, text });
+        if (!p) continue;
+        if (p[0] !== null) return { tiles: run, exp: box };
+        // Only the %: fine for a HUD that shows only the %, but keep looking
+        // for a reading with the EXP amount first.
+        pctOnly ||= { tiles: run, exp: box };
+      }
     }
   }
   return pctOnly;
+}
+
+/** How much wider than tall the game is drawn (1 = unstretched), from the
+ *  level tiles: each digit tile is 0.885 times as wide as it is tall. */
+export function hudAspect([, , w, h]) {
+  const digits = w / h > 1.3 ? 2 : 1, a = w / digits / h / 0.885;
+  return a > 0.7 && a < 1.45 ? a : 1;
 }
 
 /** Is the shared picture this tracker's own page? (Sharing the screen the
@@ -411,7 +426,7 @@ export const NORM_H = 22;
 export const GW = 12, GH = 18;
 
 /** Split a readout crop into characters. Returns {band, sat, bw, bh, boxes}. */
-export function segment(img) {
+export function segment(img, cut = 0.45) {
   const { w: W, h: H, data } = img, n = W * H;
   if (n === 0) return null;
   const g = new Uint8Array(n), sat = new Float32Array(n);
@@ -446,7 +461,7 @@ export function segment(img) {
   const band = resize(wv.subarray(ya * W, yb * W), W, sh, bw, bh);
   const satb = resize(sat.subarray(ya * W, yb * W), W, sh, bw, bh);
   const col = new Int32Array(bw);
-  for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) if (band[y * bw + x] > 0.45) col[x]++;
+  for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) if (band[y * bw + x] > cut) col[x]++;
   const segs = [];
   let x = 0;
   while (x < bw) {
@@ -468,24 +483,24 @@ export function segment(img) {
     let top = -1, bot = -1;
     for (let y = 0; y < bh; y++) {
       let any = false;
-      for (let xx = s; xx < e; xx++) if (band[y * bw + xx] > 0.45) { any = true; break; }
+      for (let xx = s; xx < e; xx++) if (band[y * bw + xx] > cut) { any = true; break; }
       if (any) { if (top < 0) top = y; bot = y; }
     }
     if (top >= 0 && (e - s) * (bot - top + 1) >= 4) boxes.push([s, top, e - s, bot - top + 1]);
   }
-  return { band, sat: satb, bw, bh, boxes };
+  return { band, sat: satb, bw, bh, boxes, cut };
 }
 
 /** Characters: ['tall', box] digits/% , ['dot', box], ['gap', null]. */
-export function characters(img) {
-  const seg = segment(img);
+export function characters(img, ink = 0.45) {
+  const seg = segment(img, ink);
   if (!seg) return null;
   const { band, sat, bw, boxes } = seg;
   const isBracket = ([x, y, w, h]) => {
     if (w < 0.22 * NORM_H) return true;
     let s = 0, c = 0;
     for (let yy = y; yy < y + h; yy++) for (let xx = x; xx < x + w; xx++) {
-      if (band[yy * bw + xx] > 0.45) { s += sat[yy * bw + xx]; c++; }
+      if (band[yy * bw + xx] > seg.cut) { s += sat[yy * bw + xx]; c++; }
     }
     return c > 0 && s / c > 0.32;
   };
@@ -586,21 +601,27 @@ export class DigitReader {
   joinPercent(r) {
     const out = [];
     for (let i = 0; i < r.chars.length; i++) {
-      const a = r.chars[i], b = r.chars[i + 1];
-      if (a[0] === "tall" && b && b[0] === "tall") {
-        const [ax, ay, aw, ah] = a[1], [bx, by, bw, bh] = b[1];
-        const gap = bx - (ax + aw), w = bx + bw - ax;
-        if (gap <= 0.15 * NORM_H && w >= 0.6 * NORM_H && w <= 1.2 * NORM_H) {
-          const y = Math.min(ay, by), box = [ax, y, w, Math.max(ay + ah, by + bh) - y];
-          const v = glyphVec(r.seg, box);
-          const sp = this.scoreFor(v, "%");
-          if (sp >= 0.7 && sp > this.classify(glyphVec(r.seg, a[1]))[1] &&
-              sp > this.classify(glyphVec(r.seg, b[1]))[1]) {
-            out.push(["tall", box]); i++; continue;
-          }
+      const a = r.chars[i];
+      let joined = false;
+      // Two or three neighbouring pieces (slash, circles, a circle taken
+      // for a dot) that together look like '%'.
+      if (a[0] === "tall") for (const n of [2, 3]) {
+        const parts = r.chars.slice(i, i + n);
+        if (parts.length < n || parts.some(p => p[0] === "gap") || parts[n - 1][0] !== "tall") continue;
+        let ok = true;
+        for (let k = 1; k < n; k++) {
+          const [px, , pw] = parts[k - 1][1];
+          if (parts[k][1][0] - (px + pw) > 0.35 * NORM_H) ok = false;
+        }
+        const ax = a[1][0], x1 = Math.max(...parts.map(p => p[1][0] + p[1][2])), w = x1 - ax;
+        if (!ok || w < 0.6 * NORM_H || w > 1.2 * NORM_H) continue;
+        const y = Math.min(...parts.map(p => p[1][1])), box = [ax, y, w, Math.max(...parts.map(p => p[1][1] + p[1][3])) - y];
+        const sp = this.scoreFor(glyphVec(r.seg, box), "%");
+        if (sp >= 0.7 && parts.every(p => p[0] !== "tall" || sp > this.classify(glyphVec(r.seg, p[1]))[1])) {
+          out.push(["tall", box]); i += n - 1; joined = true; break;
         }
       }
-      out.push(a);
+      if (!joined) out.push(a);
     }
     r.chars = out;
     return r;
@@ -629,21 +650,26 @@ export class DigitReader {
     return m;
   }
   /** -> {text: '152.225 7.00%', glyphs: [{c, score, vec}], sure} */
-  read(img) {
-    const r = characters(img);
+  read(img, ink = 0.45) {
+    const r = characters(img, ink);
     if (!r || !r.chars.length) return { text: null, glyphs: [], sure: false };
     this.joinPercent(r);
-    let text = ""; const glyphs = [];
+    let text = "", alt = ""; const glyphs = [];
     for (const [kind, b] of r.chars) {
       if (kind === "gap") text += " ";
       else if (kind === "dot") text += ".";
       else {
         const vec = glyphVec(r.seg, b), [c, score] = this.classify(vec);
         text += c; glyphs.push({ c, score, vec });
+        // A best guess for doubtful characters (soft, stretched pictures
+        // make 6, 8 and 9 look alike); only used where the numbers check out.
+        if (c === "?") { const [g, gs] = this.rank(vec)[0]; alt += gs >= 0.65 ? g : "?"; } else alt += c;
+        continue;
       }
+      alt += text.slice(-1);
     }
     const sure = glyphs.length > 0 && glyphs.every(g => g.c !== "?" && g.score >= this.SURE);
-    return { text: text.trim(), glyphs, sure };
+    return { text: text.trim(), glyphs, sure, alt: alt.trim() };
   }
   /** Learn every character of a crop from text the user typed. */
   teach(img, label) {
@@ -698,15 +724,44 @@ export function parseHudText(text) {
     const words = rest.replace(/\?/g, " ").split(/\s+/).filter(Boolean);
     const amountTxt = words.length ? words[words.length - 1].replace(/^\.+|\.+$/g, "") : "";
     if (!/^\d[\d.]*$/.test(amountTxt)) continue;
+    // A faint comma can drop out and leave a gap: "2 162" is 2,162.
+    const grouped = rest.trimEnd().match(/(?:^|[^\d.])(\d{1,3}(?: \d{3})+)$/);
     // A stray '1' in front can be the edge of the 'EXP.' label; the EXP
     // table decides which reading is real.
-    for (const t of [amountTxt, amountTxt.startsWith("1") ? amountTxt.slice(1).replace(/^\./, "") : null]) {
+    const g = grouped ? grouped[1].replace(/ /g, "") : null;
+    for (const t of [g, g?.startsWith("1") ? g.slice(1) : null, amountTxt, amountTxt.startsWith("1") ? amountTxt.slice(1).replace(/^\./, "") : null]) {
       if (!t || !/^\d[\d.]*$/.test(t)) continue;
       const amount = parseInt(t.replace(/\./g, ""), 10);
       if (levelFromAmount(amount, pct)) return [amount, pct];
     }
   }
   return null;
+}
+
+/** Parse a reading; where doubtful characters stop it, try the reader's
+ *  best guesses (the EXP table still has to agree with the amount). */
+export function bestParse(rd) {
+  const p = parseHudText(rd.text);
+  if (p && p[0] !== null) return p;
+  if (rd.alt && rd.alt !== rd.text) {
+    const q = parseHudText(rd.alt);
+    if (q && (!p || q[0] !== null)) return q;
+  }
+  return p;
+}
+
+/** Read the EXP readout. Soft, stretched text (a Mac in full screen) has
+ *  faint strokes that a lower ink cut keeps whole, so when the first
+ *  reading doesn't give the amount, try lower cuts. -> {rd, parsed} */
+export function readHud(reader, img) {
+  let first = null, pctOnly = null;
+  for (const cut of [0.45, 0.35, 0.25]) {
+    const rd = reader.read(img, cut), parsed = bestParse(rd);
+    first ||= { rd, parsed };
+    if (parsed && parsed[0] !== null) return { rd, parsed };
+    if (parsed) pctOnly ||= { rd, parsed };
+  }
+  return pctOnly || first;
 }
 
 // --------------------------------------------------------------- trackers
@@ -1059,11 +1114,12 @@ export class Session {
       this.event(now, "hud", this.hadHud ? "Found the HUD again" : "Found the HUD");
       this.hadHud = true; this.lostAnnounced = false;
       this.hud = hud; this.status = "tracking"; this.lastOk = now;
+      if (this.feedReader) this.feedReader.aspect = hudAspect(hud.tiles);
     }
     const img = getFrame(this.hud.exp);
     if (!img) return null;
-    const { text, glyphs, sure } = this.reader.read(img);
-    let parsed = parseHudText(text);
+    const hr = readHud(this.reader, img), { text, glyphs, sure } = hr.rd;
+    let parsed = hr.parsed;
     if (parsed && parsed[0] === null && !sure) {
       // A % alone has no arithmetic check: a doubtful one must repeat.
       const same = this.prevUnsure && parsed[1] === this.prevUnsure[1];
@@ -1157,26 +1213,6 @@ export class Session {
     }
     return obs;
   }
-  teachMeso(getFrame, typed) {
-    const digits = String(typed).replace(/\D/g, "");
-    if (!digits) return "Type the number shown in the inventory, like 2,668,039.";
-    let box = this.mesoBox;
-    if (!box) {
-      const full = getFrame(null);
-      const fields = full ? mesoFields(full) : [];
-      box = fields[0];
-    }
-    if (!box) return "Couldn't find the inventory's meso field. Open the Item Inventory window so it's visible.";
-    const img = getFrame(box);
-    const inv = new Uint8ClampedArray(img.data.length);
-    for (let i = 0; i < inv.length; i += 4) {
-      inv[i] = 255 - img.data[i]; inv[i + 1] = 255 - img.data[i + 1]; inv[i + 2] = 255 - img.data[i + 2]; inv[i + 3] = 255;
-    }
-    if (!this.mesoReader.teach({ w: img.w, h: img.h, data: inv }, digits))
-      return "That doesn't match the number of digits I see. Check the number and try again.";
-    this.mesoBox = box; this.mesoOk = Date.now();
-    return null;
-  }
   /** EXP, % and mesos per hour at elapsed time `el` (seconds). */
   computeRates(el, g) {
     if (el < Session.RATE_START) return { expHr: null, nowHr: null, pctHr: null, mesoHr: null };
@@ -1228,7 +1264,6 @@ export class Session {
       mesos, mesoHr, mesoTotal: this.meso.last,
       mesoSpent: this.meso.spent, mesoVisible, mesoTracking: !!this.mesoReader,
       feedActive, mesoFromFeed: this.mesoFromFeed, mesoFromInv: this.mesoFromInv,
-      mesoNeedsTeach: !!this.mesoUnreadable && !mesoVisible,
       running: !!this.running, status: this.status, elapsed: el, mode: this.mode,
       exp: g, expHr, nowHr, pctHr, level, pct, eta,
       needsLevel: this.mode === "pct" && !this.pct.startLevel,
@@ -1514,7 +1549,7 @@ export function feedType(prefix, sat = null) {
 }
 
 /** Read one line: {type, value, sure, text}. */
-export function readFeedLine(f, line, th, reader) {
+export function readFeedLine(f, line, th, reader, aspect = 1) {
   const e = feedEnd(f, line, th);
   if (!e) return { type: "other", value: null, sure: false, text: "", prefix: undefined };
   const small = e.inner.filter(b => b[3] < 0.75 * NORM_H);
@@ -1549,7 +1584,9 @@ export function readFeedLine(f, line, th, reader) {
     text += c;
     if (c === "?" || score < reader.SURE) sure = false;
   }
-  let type = letters ? "item" : feedType(e.prefix, line.sat ?? null);
+  // A stretched picture (a 4:3 game on a wide screen) makes text wider or
+  // narrower than its height says: measure in unstretched units.
+  let type = letters ? "item" : feedType(e.prefix / aspect, line.sat ?? null);
   const plus = small.length >= 1 && (!tall.length || small[0][0] < tall[0][0]);
   const value = type !== "item" && plus && /^[0-9]{1,7}$/.test(text) ? Number(text) : null;
   if (type === "other" && value === null) sure = false;
@@ -1562,7 +1599,7 @@ export function readFeedLine(f, line, th, reader) {
 export const FEED_TH = 0.76;
 
 export class FeedReader {
-  constructor(reader) { this.reader = reader; this.anchor = null; this.samples = []; this.lastSearch = 0; this.lastSeen = 0; }
+  constructor(reader) { this.reader = reader; this.anchor = null; this.samples = []; this.lastSearch = 0; this.lastSeen = 0; this.aspect = 1; }
   /** Search the lower right of the picture for the feed. */
   locate(full) {
     const rx = Math.floor(full.w * 0.5), ry = Math.floor(full.h * 0.35);
@@ -1572,7 +1609,7 @@ export class FeedReader {
     if (!r.xr || !r.lines.length) return null;
     const th = feedTextHeight(r.lines);
     if (!th) return null;
-    const read = r.lines.map(l => ({ l, r: readFeedLine(f, l, th, this.reader) }));
+    const read = r.lines.map(l => ({ l, r: readFeedLine(f, l, th, this.reader, this.aspect) }));
     const good = read.filter(x => x.r.value !== null && x.r.type !== "other");
     if (!good.length) return null;
     const real = read.filter(x => x.r.prefix !== undefined);       // lines ending in brackets
@@ -1587,7 +1624,7 @@ export class FeedReader {
     let yb = Math.max(...real.map(x => x.r.bottom));
     for (let n = 0; n < 3; n++) {
       const l = feedLineAt(f, yb + pitch - 1.08 * FEED_TH * pitch, yb + pitch + 0.12 * FEED_TH * pitch, xr);
-      if (!l || readFeedLine(f, l, FEED_TH * pitch, this.reader).prefix === undefined) break;
+      if (!l || readFeedLine(f, l, FEED_TH * pitch, this.reader, this.aspect).prefix === undefined) break;
       yb += pitch;
     }
     const ys = [yb];
@@ -1613,7 +1650,7 @@ export class FeedReader {
       const yb = a.yb - by - k * a.pitch;
       const l = feedLineAt(f, yb - 1.08 * a.th, yb + 0.12 * a.th, xr);
       if (!l) continue;
-      out.push({ slot: k, strength: l.strength, ...readFeedLine(f, l, a.th, this.reader) });
+      out.push({ slot: k, strength: l.strength, ...readFeedLine(f, l, a.th, this.reader, this.aspect) });
     }
     // A real line below the bottom: the bottom is lower than we thought.
     if (out.some(o => o.slot === -1 && o.type !== "other" && o.prefix !== undefined)) {

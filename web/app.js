@@ -373,7 +373,6 @@ function render() {
 
   // prompts
   if (s.needsLevel && !asked.level && !promptOpen) askLevel("Your HUD shows only the EXP percentage. What level is your character? I'll turn % into EXP from here.");
-  else if (s.mesoNeedsTeach && !asked.meso && !promptOpen) askMeso();
 
   document.body.classList.toggle("idle", !source && !s.elapsed);
   renderTrail(s);
@@ -411,21 +410,6 @@ function askLevel(label = "What level is your character right now?") {
     session.setLevel(lv); store.set("mt.level", lv);
     return null;
   });
-}
-function askMeso() {
-  asked.meso = true;
-  openPrompt("meso", "I can see your meso total but don't know all of its digits yet. Type the number shown in the inventory, and I'll learn them.", "", v => {
-    if (!source) return "Share the game window first.";
-    return teachFromCurrentFrame(v);
-  });
-}
-async function teachFromCurrentFrame(v) {
-  const frame = await currentFrame();
-  if (!frame) return "Share the game window first.";
-  const err = session.teachMeso(box => region(frame, box), v);
-  frame.bitmap?.close?.();
-  if (!err) store.set("mt.learned.meso", mesoReader.learned);
-  return err;
 }
 // ---------------------------------------------------------------- pop-out
 // ------------------------------------------------------------ pop-out
@@ -540,7 +524,6 @@ $("sessions-clear").onclick = () => {
   saved = []; store.set(SESS_KEY, saved); renderSessions();
 };
 $("set-level").onclick = () => askLevel();
-$("teach-meso").onclick = () => askMeso();
 $("refind").onclick = () => { session.relocate(); session.mesoBox = null; showStatus("Looking for the HUD again"); };
 $("file").onchange = e => { const f = e.target.files[0]; if (f) openVideo(f); e.target.value = ""; };
 $("download").onclick = () => {
@@ -554,7 +537,11 @@ $("download").onclick = () => {
   a.click(); URL.revokeObjectURL(a.href);
 };
 $("snapshot").onclick = async () => {
-  const frame = lastFrame && source ? await currentFrame() : null;
+  if (!(lastFrame && source)) { showStatus("Share the game window first.", true); return; }
+  // On one screen the page itself covers the game: give time to switch back.
+  showStatus("Saving a picture in 5 seconds: switch to the game now.");
+  await new Promise(r => setTimeout(r, 5000));
+  const frame = source ? await currentFrame() : null;
   if (!frame) { showStatus("Share the game window first.", true); return; }
   const c = document.createElement("canvas"); c.width = frame.w; c.height = frame.h;
   c.getContext("2d").drawImage(frame.src, 0, 0);
