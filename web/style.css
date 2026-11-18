@@ -29,6 +29,15 @@ button, input { font: inherit; }
 .mark { font: 800 28px/1 var(--display); margin: 0; display: flex; align-items: center; gap: 10px; letter-spacing: -0.01em; }
 .leaf { width: 22px; height: 22px; background: var(--tile); clip-path: polygon(50% 0, 62% 30%, 95% 22%, 75% 52%, 100% 70%, 62% 70%, 55% 100%, 45% 100%, 38% 70%, 0 70%, 25% 52%, 5% 22%, 38% 30%); }
 .top-actions { display: flex; gap: 10px; }
+.pip-btn { display: inline-flex; align-items: center; gap: 8px; }
+/* hover / keyboard-focus description for the Picture-in-Picture button */
+.tip-wrap { position: relative; display: inline-flex; }
+.tip { position: absolute; top: calc(100% + 10px); right: 0; z-index: 5; width: max-content; max-width: 260px; padding: 10px 12px; border-radius: 9px;
+  background: var(--steel-200); color: #18202b; font-size: 14px; line-height: 1.4; box-shadow: 0 6px 18px rgba(0, 0, 0, .35);
+  opacity: 0; visibility: hidden; transform: translateY(-4px); transition: opacity .12s, transform .12s, visibility .12s; pointer-events: none; }
+.tip::before { content: ""; position: absolute; top: -6px; right: 28px; border: 6px solid transparent; border-top: 0; border-bottom-color: var(--steel-200); }
+.tip-wrap:hover .tip, .pip-btn:focus-visible + .tip { opacity: 1; visibility: visible; transform: none; }
+@media (prefers-reduced-motion: reduce) { .tip { transition: none; } }
 
 /* buttons: chunky like the game's, without copying its art */
 .btn { border: 2px solid var(--slate-700); background: var(--slate-800); color: var(--paper); padding: 9px 16px; border-radius: 9px; cursor: pointer; font-weight: 700; }
@@ -174,18 +183,22 @@ tr:hover .del, .del:focus-visible { opacity: 1; }
 .foot p { margin: 4px 0; }
 .version { font-size: 13px; opacity: .8; }
 
-/* pop-out window */
-body.pip { margin: 0; background: var(--slate-800); }
-.mini { padding: 12px 14px; font-size: 14px; }
-.mini-head { display: flex; align-items: center; gap: 8px; font-variant-numeric: tabular-nums; color: var(--muted); }
-.mini-lv { margin-left: auto; color: var(--paper); font-weight: 700; }
-.mini-gauge { height: 10px; border-radius: 4px; background: #d8dde6; overflow: hidden; margin: 8px 0 4px; }
-.mini-eta { margin: 0 0 6px; color: var(--muted); }
-.mini-num { margin: 0; font: 800 30px/1.1 var(--display); color: var(--gauge); font-variant-numeric: tabular-nums; }
-.mini-num.meso { color: var(--gold); margin-top: 6px; }
-.mini-num small { font: 400 13px var(--text); color: var(--muted); margin-left: 6px; }
-.mini-sub { margin: 0; color: var(--muted); }
-.mini .btn { margin-top: 10px; width: 100%; }
+.ov-fallback { display: flex; align-items: center; gap: 16px; margin: 0 0 18px; color: var(--muted); }
+.ov-fallback[hidden] { display: none; }
+.ov-fallback p { margin: 0; max-width: 44ch; }
+.ov-video { width: 200px; height: 75px; border-radius: 8px; border: 2px solid var(--slate-700); background: var(--slate-800); }
+
+/* pop-out overlay: floats over the game. Just the two rates; side by
+   side when the window is made wide and short. Dimmed while paused. */
+body.pip { margin: 0; background: var(--slate-800); overflow: hidden; }
+.ov { box-sizing: border-box; height: 100vh; padding: 6px 10px; display: flex; flex-direction: column; justify-content: center; gap: 2px; }
+.ov.paused { opacity: .55; }
+.ov-num { margin: 0; font: 800 26px/1.05 var(--display); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ov-num.exp { color: var(--gauge); }
+.ov-num.meso { color: var(--gold); }
+.ov-num small { font: 400 12px var(--text); color: var(--muted); margin-left: 5px; }
+@media (max-height: 64px) { .ov { flex-direction: row; align-items: center; justify-content: flex-start; gap: 14px; } .ov-num { font-size: 20px; } }
+@media (min-height: 120px) and (min-width: 260px) { .ov-num { font-size: 34px; } }
 
 @media (max-width: 1040px) {
   .layout { grid-template-columns: 1fr; }

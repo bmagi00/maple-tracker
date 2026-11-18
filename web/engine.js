@@ -319,14 +319,35 @@ export function findMeso(img, reader) {
   return null;
 }
 
-/** Read the meso field: invert (dark digits -> light) and match. */
+/** Read the meso field: invert (dark digits -> light) and match. The
+ *  field is wide and the number small, so trim to the digits first. */
 export function readMeso(img, reader) {
-  const inv = new Uint8ClampedArray(img.data.length);
-  for (let i = 0; i < img.data.length; i += 4) {
-    inv[i] = 255 - img.data[i]; inv[i + 1] = 255 - img.data[i + 1];
-    inv[i + 2] = 255 - img.data[i + 2]; inv[i + 3] = 255;
+  let x0 = img.w, x1 = -1;
+  for (let y = 0; y < img.h; y++) for (let x = 0; x < img.w; x++) {
+    const i = (y * img.w + x) * 4;
+    if (Math.min(img.data[i], img.data[i + 1], img.data[i + 2]) < 200) { if (x < x0) x0 = x; if (x > x1) x1 = x; }
   }
-  return reader.read({ w: img.w, h: img.h, data: inv });
+  if (x1 > x0 && x1 - x0 < img.w - 6) img = crop(img, Math.max(0, x0 - 3), 0, Math.min(img.w, x1 + 4) - Math.max(0, x0 - 3), img.h);
+  const plain = invert(img, 1);
+  const r = reader.read(plain);
+  if (parseMeso(r.text) !== null) return r;
+  // A scaled-up or blurry picture turns the thin strokes light grey and
+  // broken: try again with the contrast turned up.
+  const strong = reader.read(invert(img, 2.2));
+  return parseMeso(strong.text) !== null ? strong : r;
+}
+/** Dark-on-white to light-on-dark, with optional contrast boost. */
+function invert(img, gain) {
+  const n = img.w * img.h, m = new Uint8Array(n);
+  for (let i = 0; i < n; i++) m[i] = Math.min(img.data[i * 4], img.data[i * 4 + 1], img.data[i * 4 + 2]);
+  const bg = percentileOfBytes(m, 80);
+  const inv = new Uint8ClampedArray(n * 4);
+  for (let i = 0; i < n; i++) {
+    const v = gain === 1 ? 255 - Math.max(img.data[i * 4], img.data[i * 4 + 1], img.data[i * 4 + 2])   // as before
+      : Math.max(0, Math.min(255, (bg - m[i]) * gain + 255 - bg));
+    inv[i * 4] = inv[i * 4 + 1] = inv[i * 4 + 2] = v; inv[i * 4 + 3] = 255;
+  }
+  return { w: img.w, h: img.h, data: inv };
 }
 
 /** '2.668.039' -> 2668039 (commas read as points). */
@@ -815,7 +836,11 @@ export class MesoTracker {
   pend(v, why) {
     if (this.pending.length && this.pending[this.pending.length - 1] === v) this.pending.push(v);
     else this.pending = [v];
-    if (this.pending.length < this.CONFIRM) return `wait-${why}`;
+    // A total that suddenly has 2+ fewer (or more) digits is almost always
+    // a misread (part of the number hidden or blurred): it must hold for a
+    // good while before it's believed.
+    const odd = this.last !== null && Math.abs(String(v).length - String(this.last).length) >= 2;
+    if (this.pending.length < (odd ? 12 : this.CONFIRM)) return `wait-${why}`;
     this.pending = [];
     if (this.last === null) { this.last = v; return "baseline"; }
     const d = v - this.last;
@@ -1308,6 +1333,41 @@ export function feedLineAt(f, y0, y1, xr) {
   return { y0, y1, x0, x1: x1 + 1, strength: n ? s / n : 0, sat: n ? st / n : 0, ink: n };
 }
 
+/** Columns lit in most rows are window edges and borders, not text (the
+ *  lines end only a few pixels from the game window's edge): clear them. */
+export function maskBorders(f, run = 0.6 * f.h) {
+  // A border is lit in one long unbroken stretch; text columns break
+  // between lines.
+  const { w, h, ink } = f;
+  for (let x = 0; x < w; x++) {
+    let cur = 0, longest = 0;
+    for (let y = 0; y < h; y++) { if (ink[y * w + x] > 0.4) { if (++cur > longest) longest = cur; } else cur = 0; }
+    if (longest < run) continue;
+    for (let k = Math.max(0, x - 1); k <= Math.min(w - 1, x + 1); k++) for (let y = 0; y < h; y++) ink[y * w + k] = 0;
+  }
+}
+
+/** The line spacing: autocorrelation of how much text ends near the right
+ *  edge, row by row, in rows top..bot. Null if there's no clear period. */
+export function feedPitch(f, xr, th, top = 0, bot = f.h) {
+  const x0 = Math.max(0, Math.round(xr - 4 * th)), p = [];
+  for (let y = top; y < bot; y++) { let c = 0; for (let x = x0; x <= Math.min(f.w - 1, xr + 2); x++) if (f.ink[y * f.w + x] > 0.4) c++; p.push(c); }
+  if (p.length < 3 * th) return null;
+  const mean = p.reduce((a, b) => a + b, 0) / p.length, q = p.map(v => v - mean);
+  const ac = lag => { let v = 0; for (let y = 0; y + lag < q.length; y++) v += q[y] * q[y + lag]; return v / (q.length - lag); };
+  let lag = 0, best = -Infinity;
+  const acs = [];
+  for (let L = Math.ceil(0.9 * th); L <= Math.floor(2.2 * th); L++) { const v = ac(L); acs.push([L, v]); if (v > best) { best = v; lag = L; } }
+  if (best <= 0) return null;
+  // a multiple of the spacing can score as well: take the smallest strong peak
+  for (let i = 1; i < acs.length - 1; i++) {
+    const [L, v] = acs[i];
+    if (v >= 0.8 * best && v >= acs[i - 1][1] && v >= acs[i + 1][1]) { lag = L; best = v; break; }
+  }
+  const a0 = ac(lag - 1), a2 = ac(lag + 1), d = a0 - 2 * best + a2;
+  return d < 0 ? lag + 0.5 * (a0 - a2) / d : lag;
+}
+
 /** Typical text height of feed lines (bracket height): the median band. */
 export function feedTextHeight(lines) {
   const hs = lines.map(l => l.y1 - l.y0).filter(v => v >= 8 && v <= 40).sort((a, b) => a - b);
@@ -1464,19 +1524,10 @@ export class FeedReader {
     const real = read.filter(x => x.r.prefix !== undefined);       // lines ending in brackets
     if (!real.length) return null;
     // Line spacing: the period of the text rows ending at the right edge
-    // (autocorrelation of the row profile), which doesn't need every line
-    // to be readable.
-    const xr = r.xr, x0 = Math.max(0, Math.round(xr - 4 * th));
+    // (which doesn't need every line to be readable).
+    const xr = r.xr;
     const top = Math.max(0, Math.min(...r.lines.map(l => l.y0)) - th), bot = Math.min(f.h, Math.max(...r.lines.map(l => l.y1)) + 2 * th);
-    const p = [];
-    for (let y = top; y < bot; y++) { let c = 0; for (let x = x0; x <= Math.min(f.w - 1, xr + 2); x++) if (f.ink[y * f.w + x] > 0.4) c++; p.push(c); }
-    const mean = p.reduce((x, y) => x + y, 0) / p.length, q = p.map(v => v - mean);
-    const ac = lag => { let v = 0; for (let y = 0; y + lag < q.length; y++) v += q[y] * q[y + lag]; return v / (q.length - lag); };
-    let lag = 0, best = -Infinity;
-    for (let L = Math.ceil(0.9 * th); L <= Math.floor(2.2 * th); L++) { const v = ac(L); if (v > best) { best = v; lag = L; } }
-    let pitch = lag;
-    if (lag) { const a0 = ac(lag - 1), a2 = ac(lag + 1), d = a0 - 2 * best + a2; if (d < 0) pitch = lag + 0.5 * (a0 - a2) / d; }
-    else pitch = 1.25 * th;
+    const pitch = feedPitch(f, xr, th, top, bot) || 1.25 * th;
     // The bottom line: the lowest readable one, then further down while
     // there's text one spacing lower.
     let yb = Math.max(...real.map(x => x.r.bottom));
@@ -1502,6 +1553,7 @@ export class FeedReader {
   read(img) {
     const a = this.anchor, [bx, by] = this.box();
     const f = feedInk(img), xr = Math.round(a.xr - bx);
+    maskBorders(f, 2 * a.pitch);
     let out = [];
     for (let k = -1; k < 8; k++) {
       const yb = a.yb - by - k * a.pitch;
@@ -1514,6 +1566,17 @@ export class FeedReader {
       a.yb += a.pitch; out.forEach(o => o.slot++);
     }
     out = out.filter(o => o.slot >= 0).sort((p, q) => q.slot - p.slot);
+    // Busy moments (4+ lines) measure the spacing well: keep the median.
+    if (out.filter(o => o.prefix !== undefined).length >= 4) {
+      const pp = feedPitch(f, xr, a.th);
+      if (pp && Math.abs(pp / a.pitch - 1) < 0.15) {
+        this.samples.push(pp); if (this.samples.length > 60) this.samples.shift();
+        if (this.samples.length >= 3) {
+          const srt = this.samples.slice().sort((x, y) => x - y), m = srt[srt.length >> 1];
+          a.pitch = m; a.th = FEED_TH * m;
+        }
+      }
+    }
     // Fine-tune the bottom from where the bottom line's ')' really is.
     // (The spacing found when locating is kept: it's measured over many rows.)
     for (const o of out) {

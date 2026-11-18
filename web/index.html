@@ -18,10 +18,20 @@
   <header class="top">
     <h1 class="mark"><span class="leaf" aria-hidden="true"></span>Maple Tracker</h1>
     <div class="top-actions">
-      <button id="popout" class="btn ghost" type="button" hidden>Pop out</button>
+      <span class="tip-wrap">
+        <button id="popout" class="btn ghost pip-btn" type="button" aria-describedby="popout-tip" hidden>
+          <svg viewBox="0 0 20 16" width="18" height="14" aria-hidden="true"><rect x="1" y="1" width="18" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/><rect x="10" y="8" width="7" height="5" rx="1" fill="currentColor"/></svg>
+          Picture-in-Picture
+        </button>
+        <span id="popout-tip" class="tip" role="tooltip">Float EXP/hr and mesos/hr over your game.</span>
+      </span>
       <button id="share" class="btn primary" type="button">Share game window</button>
     </div>
   </header>
+
+  <div id="ov-fallback" class="ov-fallback" hidden>
+    <p>Firefox: point at the numbers on the left and click the small pop-out button that appears on them.</p>
+  </div>
 
   <div class="layout">
     <div class="live">
@@ -146,14 +156,9 @@
 <canvas id="work" hidden></canvas>
 
 <template id="mini">
-  <div class="mini">
-    <div class="mini-head"><span class="dot" data-k="dot"></span><span data-k="clock">0:00:00</span><span class="mini-lv" data-k="lv"></span></div>
-    <div class="mini-gauge"><div class="gauge-fill" data-k="fill"></div></div>
-    <p class="mini-eta" data-k="eta"></p>
-    <p class="mini-num"><span data-k="exphr">–</span><small>EXP/hr</small></p>
-    <p class="mini-sub" data-k="expnow"></p>
-    <p class="mini-num meso"><span data-k="mesohr">–</span><small>mesos/hr</small></p>
-    <button class="btn small" type="button" data-k="toggle">Pause</button>
+  <div class="ov">
+    <p class="ov-num exp"><span data-k="exphr">–</span><small>EXP/hr</small></p>
+    <p class="ov-num meso"><span data-k="mesohr">–</span><small>mesos/hr</small></p>
   </div>
 </template>
 

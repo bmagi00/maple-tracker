@@ -395,9 +395,17 @@ async function teachFromCurrentFrame(v) {
   return err;
 }
 // ---------------------------------------------------------------- pop-out
+// ------------------------------------------------------------ pop-out
+// A small always-on-top window to lay over the game on one screen.
+// Chrome and Edge: a real little page (Document Picture-in-Picture).
+// Elsewhere: the same numbers drawn into a video, shown with the browser's
+// ordinary video picture-in-picture.
+const OV_SIZE = "mt.overlay.size";
 async function popOut() {
   if (pip) { pip.focus?.(); return; }
-  pip = await window.documentPictureInPicture.requestWindow({ width: 260, height: 250 });
+  if (!("documentPictureInPicture" in window)) return popOutVideo();
+  const size = store.get(OV_SIZE, { width: 210, height: 80 });
+  pip = await window.documentPictureInPicture.requestWindow(size);
   for (const sheet of document.styleSheets) {
     try {
       const style = document.createElement("style");
@@ -408,24 +416,69 @@ async function popOut() {
       pip.document.head.append(link);
     }
   }
+  pip.document.title = "Maple Tracker";
   pip.document.body.className = "pip";
   pip.document.body.append($("mini").content.cloneNode(true));
-  pip.document.querySelector("[data-k=toggle]").onclick = toggle;
-  pip.addEventListener("pagehide", () => { pip = null; });
+  // remember the size the player chose, for next time
+  pip.addEventListener("resize", () => store.set(OV_SIZE, { width: pip.innerWidth, height: pip.innerHeight }));
+  pip.addEventListener("pagehide", () => { pip = null; render(); });
+  overlayTip();
   render();
 }
+/** Sharing the whole screen with the overlay on it: it would cover the game
+ *  in the picture the tracker reads. Say so once. */
+function overlayTip() {
+  const surface = track?.getSettings?.().displaySurface;
+  if (surface === "monitor") showStatus("You're sharing your whole screen, so the pop-out is in the picture too. Share just the game window, or keep the pop-out away from the bottom bar and the bottom-right corner.", true);
+}
+function overlayText(s) {
+  const rate = v => v === null || v === undefined ? (s.running ? "…" : "–") : fmt(v);
+  return { exphr: rate(s.expHr), mesohr: rate(s.mesoHr) };
+}
 function renderPip(s) {
+  if (pipVideo) drawOverlayCanvas(s);
   if (!pip) return;
-  const q = k => pip.document.querySelector(`[data-k=${k}]`);
-  q("dot").classList.toggle("on", s.running);
-  q("clock").textContent = hms(s.elapsed);
-  q("lv").textContent = s.level ? `Lv ${s.level}${s.pct !== null ? ` · ${s.pct.toFixed(2)}%` : ""}` : (s.pct !== null ? `${s.pct.toFixed(2)}%` : "");
-  q("fill").style.width = `${s.pct ?? 0}%`;
-  q("eta").textContent = s.eta ? `Next level in ${hms(s.eta)}` : "";
-  q("exphr").textContent = fmt(s.expHr);
-  q("expnow").textContent = s.nowHr ? `now ${fmt(s.nowHr)}/hr` : "";
-  q("mesohr").textContent = fmt(s.mesoHr);
-  q("toggle").textContent = s.running ? "Pause" : "Resume";
+  const q = k => pip.document.querySelector(`[data-k=${k}]`), t = overlayText(s);
+  pip.document.querySelector(".ov").classList.toggle("paused", !s.running);
+  q("exphr").textContent = t.exphr;
+  q("mesohr").textContent = t.mesohr;
+}
+
+// Fallback: the overlay drawn on a canvas, streamed into a video, popped
+// out with video picture-in-picture (Safari and older browsers). Firefox
+// has no button for websites to call, but shows its own pop-out button on
+// the video.
+let pipVideo = null, pipCanvas = null;
+async function popOutVideo() {
+  if (!pipCanvas) {
+    pipCanvas = Object.assign(document.createElement("canvas"), { width: 400, height: 150 });
+    pipVideo = Object.assign(document.createElement("video"), { muted: true, playsInline: true, autoplay: true });
+    pipVideo.className = "ov-video";
+    pipVideo.srcObject = pipCanvas.captureStream(4);
+    drawOverlayCanvas(session.snapshot());
+  }
+  await pipVideo.play().catch(() => {});
+  if (pipVideo.requestPictureInPicture) {
+    try { await pipVideo.requestPictureInPicture(); overlayTip(); return; } catch { /* fall through */ }
+  }
+  // Firefox: show the video on the page; its own pop-out button does the rest.
+  const holder = $("ov-fallback");
+  holder.hidden = false;
+  if (!holder.contains(pipVideo)) holder.prepend(pipVideo);
+}
+function drawOverlayCanvas(s) {
+  const c = pipCanvas, g = c.getContext("2d"), t = overlayText(s), css = getComputedStyle(document.documentElement);
+  const v = n => css.getPropertyValue(n).trim();
+  g.fillStyle = v("--slate-800"); g.fillRect(0, 0, c.width, c.height);
+  g.globalAlpha = s.running ? 1 : 0.55; g.textBaseline = "top";
+  const num = (y, text, color, label) => {
+    g.font = "800 60px 'Baloo 2', system-ui, sans-serif"; g.fillStyle = color; g.fillText(text, 18, y);
+    const w = g.measureText(text).width;
+    g.font = "400 22px 'Atkinson Hyperlegible', system-ui, sans-serif"; g.fillStyle = v("--muted"); g.fillText(label, 28 + w, y + 30);
+  };
+  num(10, t.exphr, v("--gauge"), "EXP/hr");
+  num(80, t.mesohr, v("--gold"), "mesos/hr");
+  g.globalAlpha = 1;
 }
 
 // ---------------------------------------------------------------- controls
@@ -477,7 +530,9 @@ $("snapshot").onclick = async () => {
     a.click(); URL.revokeObjectURL(a.href);
   }, "image/png");
 };
-if ("documentPictureInPicture" in window) { $("popout").hidden = false; $("popout").onclick = popOut; }
+// Every browser gets the button: Chrome and Edge get the small page,
+// others the video version.
+$("popout").hidden = false; $("popout").onclick = popOut;
 if (!navigator.mediaDevices?.getDisplayMedia) showStatus("Window sharing needs Chrome or Edge on a computer.", true);
 
 window.__mapleTracker = { session }; // for the browser test
