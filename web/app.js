@@ -331,7 +331,10 @@ function render() {
     // Finding the game's bar can take a little while: say so plainly. Only
     // after a long time, a gentle nudge (the details are in Troubleshooting).
     searchingSince ??= Date.now();
-    msg = Date.now() - searchingSince < 120000
+    if (session.selfShare) {
+      msg = "You're sharing the screen this tracker is on. Click \u201cShare a different window\u201d and pick the screen (or window) with MapleStory.";
+      warn = true;
+    } else msg = Date.now() - searchingSince < 120000
       ? "Kill some mobs to start tracking. It can take 30 seconds to a minute while it calibrates to MapleStory's heads-up display."
       : "Still calibrating. Check that the screen or window you shared shows the game, including its bottom bar.";
   }

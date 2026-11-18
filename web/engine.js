@@ -302,6 +302,20 @@ export function findHud(img, reader, why = {}) {
   return pctOnly;
 }
 
+/** Is the shared picture this tracker's own page? (Sharing the screen the
+ *  browser is on, instead of the one with the game.) The page is mostly two
+ *  slate colours that game maps don't cover so evenly. */
+export function looksLikeTracker(img) {
+  const { w, h, data } = img, near = (r, g, b, R, G, B) => Math.abs(r - R) <= 7 && Math.abs(g - G) <= 7 && Math.abs(b - B) <= 7;
+  let n = 0, hit = 0;
+  for (let y = 0; y < h; y += 6) for (let x = 0; x < w; x += 6) {
+    const i = (y * w + x) * 4, r = data[i], g = data[i + 1], b = data[i + 2];
+    n++;
+    if (near(r, g, b, 31, 38, 50) || near(r, g, b, 42, 51, 66) || near(r, g, b, 35, 43, 56)) hit++;
+  }
+  return n > 0 && hit / n > 0.35;
+}
+
 /** Plain-language reason the HUD wasn't found, for the page. */
 export function explainMiss(why) {
   if (!why.frame) return "No picture from the shared window yet.";
@@ -1025,8 +1039,9 @@ export class Session {
       if (!full) { this.miss = "No picture from the shared window yet."; return null; }
       const why = {};
       const hud = findHud(full, this.reader, why);
+      this.selfShare = !hud && looksLikeTracker(full);
       if (!hud) {
-        this.miss = explainMiss(why);
+        this.miss = this.selfShare ? "The shared picture shows this tracker, not the game." : explainMiss(why);
         const row = { time: new Date(now).toISOString(), text: why.tried[0]?.text || "", exp: "", pct: "",
                       decision: "hud-not-found", gained: "", mesoText: "", meso: "", mesoDecision: "",
                       note: `${why.frame}; orange ${why.orange}; LV tiles ${why.lvTiles}; tried ${JSON.stringify(why.tried)}` };
