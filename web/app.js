@@ -267,7 +267,7 @@ function drawSees(frame) {
   }
   const expShown = !last ? "–" : last.pct !== ""
     ? `${last.exp !== "" ? fmt(last.exp) + " " : ""}[${Number(last.pct).toFixed(2)}%]`
-    : last.text ? `not sure yet (reads “${last.text}”)` : "not found";
+    : last.text ? `not sure yet (reads “${last.text}”)` : (session.miss || "not found");
   const mesoShown = !last ? "–" : last.meso !== "" ? fmt(last.meso)
     : last.mesoText ? `not sure yet (reads “${last.mesoText}”)` : "inventory not visible";
   $("see-exp-text").textContent = `EXP: ${expShown}`;
@@ -277,7 +277,7 @@ function drawSees(frame) {
     : `Pickup messages: ${obs.length ? obs.slice().sort((a, b) => b.slot - a.slot).map(o => o.type === "other" ? "?" : `${o.type} ${o.value ?? "?"}`).join(", ") : "none on screen"}`;
 }
 
-let statusOverride = null;
+let statusOverride = null, searchingSince = null;
 function showStatus(msg, warn = false) { statusOverride = { msg, warn, until: Date.now() + 8000 }; render(); }
 
 let pip = null;
@@ -292,14 +292,14 @@ function render() {
   }
   const pctEl = $("pct");
   if (s.pct !== null) { pctEl.textContent = `${s.pct.toFixed(2)}%`; pctEl.classList.add("live"); }
-  else { pctEl.textContent = s.status === "searching" ? "looking for the HUD…" : "waiting for the HUD"; pctEl.classList.remove("live"); }
+  else { pctEl.textContent = s.status === "searching" ? "getting ready…" : "waiting for the game"; pctEl.classList.remove("live"); }
   $("gauge-fill").style.width = `${s.pct ?? 0}%`;
   $("gauge-bar").setAttribute("aria-valuenow", s.pct ?? 0);
   const eta = $("eta");
   if (s.eta) { eta.textContent = `Next level in ${hms(s.eta)}${s.level ? ` (${fmt(expToNext(s.level) * (1 - s.pct / 100))} EXP to go)` : ""}`; eta.classList.add("live"); }
   else if (s.needsLevel) { eta.textContent = "Your HUD shows only the %. Set your level to see EXP."; eta.classList.remove("live"); }
   else if (!source) { eta.textContent = "Share the window that shows the game, and keep its bottom bar visible."; eta.classList.remove("live"); }
-  else if (s.status === "searching") { eta.textContent = "Make sure the game's bottom bar (LV, HP, MP, EXP) is visible in the shared window."; eta.classList.remove("live"); }
+  else if (s.status === "searching") { eta.textContent = "Calibrating…"; eta.classList.remove("live"); }
   else { eta.textContent = "Working out your pace…"; eta.classList.remove("live"); }
 
   // rates
@@ -327,9 +327,17 @@ function render() {
   if (statusOverride && Date.now() < statusOverride.until) ({ msg, warn } = statusOverride);
   else if (!source) msg = "Not tracking";
   else if (!s.running) msg = "Paused";
-  else if (s.status === "searching") { msg = session.miss ? `Looking for the HUD. ${session.miss}` : "Looking for the HUD"; warn = !!session.miss; }
+  else if (s.status === "searching") {
+    // Finding the game's bar can take a little while: say so plainly. Only
+    // after a long time, a gentle nudge (the details are in Troubleshooting).
+    searchingSince ??= Date.now();
+    msg = Date.now() - searchingSince < 120000
+      ? "Kill some mobs to start tracking. It can take 30 seconds to a minute while it calibrates to MapleStory's heads-up display."
+      : "Still calibrating. Check that the screen or window you shared shows the game, including its bottom bar.";
+  }
   else if (s.stale) { msg = "Can't read the EXP right now. Is something covering the bottom bar?"; warn = true; }
   else msg = source === "file" ? "Tracking the video" : "Tracking";
+  if (s.status !== "searching") searchingSince = null;
   st.textContent = msg; st.classList.toggle("warn", warn);
   const ev = [];
   if (s.levels) ev.push(`${s.levels} level-up${s.levels > 1 ? "s" : ""}`);

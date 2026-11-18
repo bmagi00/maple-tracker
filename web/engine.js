@@ -229,17 +229,21 @@ export function locateReadout(img, run, reader, diagonal = false) {
       const r = reader.read(one);
       return r.glyphs.length === 1 && reader.bestScore(r.glyphs[0].vec, "0123456789") >= 0.75;
     };
-    for (let j = i - 1, right = wd.x0, first = true; j >= 0; j--, first = false) {
-      const p = words[j], gap = right - p.x1;
-      if (gap > (first ? 2.5 : 1.2) * dh || Math.abs(p.cy - wd.cy) > 0.5 * dh) break;
-      const items = p.items.slice();
-      while (items.length && !digitLike(items[0])) items.shift();   // trim a label
-      if (items.length < 2) break;
-      const hs = items.map(c => c.h).sort((a, b) => a - b);
-      if (Math.abs(hs[hs.length >> 1] - h0) > 0.25 * h0) break;
-      left = items[0].x; right = items[0].x;
-      top = Math.min(top, ...items.map(c => c.y)); bot = Math.max(bot, ...items.map(c => c.y + c.h));
-      if (items.length < p.items.length) break;                       // label reached
+    // Walk left one character at a time over the amount ("441,495"),
+    // allowing the comma's gap; stop at the label ("EXP.", taller and
+    // bolder) or a wider gap.
+    const before = words.slice(0, i).filter(p => Math.abs(p.cy - wd.cy) <= 0.5 * dh).flatMap(p => p.items)
+      .sort((p, q) => p.x - q.x);
+    let right = wd.x0, gapLimit = 2.5 * dh;           // first gap: the '[' sits there
+    for (let k = before.length - 1; k >= 0; k--) {
+      const c = before[k], gap = right - (c.x + c.w);
+      if (gap > gapLimit) break;
+      const dhgt = Math.abs(c.h - h0);
+      const hOk = dhgt <= Math.max(1, 0.12 * h0) || (dhgt <= Math.max(1, 0.25 * h0) && digitLike(c));
+      if (!hOk) break;
+      left = c.x; right = c.x;
+      top = Math.min(top, c.y); bot = Math.max(bot, c.y + c.h);
+      gapLimit = 1.3 * dh;                            // between digits, a comma at most
     }
     // Little padding on the left: the bold 'EXP.' label is close by.
     const pl = 0.18 * th, pr = 0.4 * th, py = 0.3 * th;
@@ -254,6 +258,7 @@ export function findHud(img, reader, why = {}) {
   const scored = runs.map(r => [lvLabelScore(img, r), r]).sort((a, b) => b[0] - a[0]);
   Object.assign(why, { frame: `${img.w}x${img.h}`, orange: runs.length,
                        lvTiles: scored.filter(s => s[0] > 0).length, tried: [] });
+  let pctOnly = null;
   for (const [score, run] of scored.slice(0, 4)) {
     if (score <= 0) break;
     // Stream video: blurry digits, pieces touch at edges. The game window
@@ -264,10 +269,15 @@ export function findHud(img, reader, why = {}) {
       // so look-alikes elsewhere on screen are skipped.
       const text = box ? reader.read(crop(img, ...box)).text : null;
       why.tried.push({ tiles: run, box, text });
-      if (box && parseHudText(text)) return { tiles: run, exp: box };
+      const p = box && parseHudText(text);
+      if (!p) continue;
+      if (p[0] !== null) return { tiles: run, exp: box };
+      // Only the %: fine for a HUD that shows only the %, but keep looking
+      // for a reading with the EXP amount first.
+      pctOnly ||= { tiles: run, exp: box };
     }
   }
-  return null;
+  return pctOnly;
 }
 
 /** Plain-language reason the HUD wasn't found, for the page. */
@@ -1713,4 +1723,34 @@ export class FeedTracker {
     if (type === "exp") this.kills += sign;
     if (type === "item") this.items += sign;
   }
+}
+
+/** Every character of a line (for item names): the whole line scaled so
+ *  the text is NORM_H tall, cut into character boxes, plus the gaps
+ *  between them in NORM_H units. -> {seg, boxes, gaps} */
+export function lineGlyphs(f, line, th) {
+  const { w, ink } = f;
+  const ya = Math.max(0, Math.round((line.y0 + line.y1) / 2 - 0.62 * th)), yb = Math.min(f.h, Math.round(ya + 1.24 * th));
+  const sh = yb - ya, xa = Math.max(0, line.x0 - 2), sw = Math.min(w, line.x1 + 1) - xa;
+  if (sw < 2 || sh < 4) return null;
+  const src = new Float32Array(sw * sh);
+  for (let y = 0; y < sh; y++) for (let x = 0; x < sw; x++) src[y * sw + x] = ink[(ya + y) * w + xa + x];
+  const scale = NORM_H / th, bw = Math.max(1, Math.round(sw * scale)), bh = Math.round(sh * scale);
+  const band = resize(src, sw, sh, bw, bh);
+  const T = 0.35, col = new Int32Array(bw);
+  for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) if (band[y * bw + x] > T) col[x]++;
+  const boxes = [];
+  for (let x = 0; x < bw;) {
+    if (col[x] === 0) { x++; continue; }
+    const s = x; while (x < bw && col[x] > 0) x++;
+    let top = -1, bot = -1;
+    for (let y = 0; y < bh; y++) {
+      let any = false;
+      for (let k = s; k < x; k++) if (band[y * bw + k] > T) { any = true; break; }
+      if (any) { if (top < 0) top = y; bot = y; }
+    }
+    if (top >= 0 && (bot - top + 1) * (x - s) >= 4) boxes.push([s, top, x - s, bot - top + 1]);
+  }
+  const gaps = boxes.slice(1).map((b, i) => b[0] - (boxes[i][0] + boxes[i][2]));
+  return { seg: { band, bw, bh }, boxes, gaps, scale };
 }
