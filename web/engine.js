@@ -179,7 +179,7 @@ export function lvLabelScore(img, [x, y, w, h]) {
 
 /** Find the EXP readout on the bar right of the level tiles, by looking
  *  for a '%' sign among digit-sized shapes. */
-export function locateReadout(img, run, reader, diagonal = false) {
+export function locateReadout(img, run, reader, diagonal = false, thicken = 0) {
   const [x, y, w, th] = run;
   const y0 = Math.max(0, Math.floor(y - 1.2 * th)), y1 = Math.min(img.h, Math.floor(y + 1.1 * th));
   const x0 = x + w, x1 = Math.min(img.w, Math.round(x0 + 60 * th));   // the HUD bar only
@@ -191,8 +191,13 @@ export function locateReadout(img, run, reader, diagonal = false) {
   const mask = new Uint8Array(n);
   // A fairly low cut keeps thin, blurry strokes in one piece.
   for (let i = 0; i < n; i++) mask[i] = (g[i] - lo) / Math.max(8, hi - lo) > 0.35 ? 1 : 0;
+  // A stretched picture (a small game filling a big or Retina screen) makes
+  // thin grey strokes that fall apart into specks: thicken them so each
+  // digit holds together.
+  let m = mask;
+  for (let k = 0; k < thicken; k++) m = morph(m, band.w, band.h, true);
   const dh = 0.55 * th;   // HUD digits are about half the tile height
-  const glyphs = components(mask, band.w, band.h, diagonal)
+  const glyphs = components(m, band.w, band.h, diagonal)
     .filter(c => c.h >= 0.6 * dh && c.h <= 1.6 * dh && c.w <= 2.2 * dh && c.w >= 0.15 * dh)
     .sort((a, b) => a.x - b.x);
   // Group into words on the same text line (commas/points stay inside).
@@ -204,6 +209,18 @@ export function locateReadout(img, run, reader, diagonal = false) {
       last.items.push(c); last.x1 = Math.max(last.x1, c.x + c.w);
     } else {
       words.push({ items: [c], x0: c.x, x1: c.x + c.w, cy });
+    }
+  }
+  // A '%' drawn thin can fall into small pieces that the size filter
+  // drops: let a word take in small pieces right after it on its line.
+  if (thicken) {
+    const bits = components(m, band.w, band.h, diagonal).filter(c => c.h < 1.6 * dh && c.w < 1.2 * dh).sort((a, b) => a.x - b.x);
+    for (const wd of words) {
+      for (const c of bits) {
+        if (c.x < wd.x1 || c.x - wd.x1 > 0.5 * dh) continue;
+        if (Math.abs(c.y + c.h / 2 - wd.cy) > 0.6 * dh) continue;
+        wd.x1 = Math.max(wd.x1, c.x + c.w);
+      }
     }
   }
   const medH = wd => { const hs = wd.items.map(c => c.h).sort((a, b) => a - b); return hs[hs.length >> 1]; };
@@ -255,16 +272,21 @@ export function locateReadout(img, run, reader, diagonal = false) {
 
 export function findHud(img, reader, why = {}) {
   const runs = orangeRuns(img);
-  const scored = runs.map(r => [lvLabelScore(img, r), r]).sort((a, b) => b[0] - a[0]);
+  // The bar is nearly always in the lower part of the picture, and its
+  // tiles aren't tiny: prefer those (busy maps have plenty of orange).
+  const rank = r => { const s = lvLabelScore(img, r); return s <= 0 ? 0 : s + 0.6 * (r[1] / img.h) + (r[3] >= 11 ? 0.2 : 0); };
+  const scored = runs.map(r => [rank(r), r]).sort((a, b) => b[0] - a[0]);
   Object.assign(why, { frame: `${img.w}x${img.h}`, orange: runs.length,
                        lvTiles: scored.filter(s => s[0] > 0).length, tried: [] });
   let pctOnly = null;
-  for (const [score, run] of scored.slice(0, 4)) {
+  for (const [score, run] of scored.slice(0, 6)) {
     if (score <= 0) break;
     // Stream video: blurry digits, pieces touch at edges. The game window
     // itself: crisp 1-pixel digits whose strokes only meet at corners.
-    for (const diagonal of [false, true]) {
-      const box = locateReadout(img, run, reader, diagonal);
+    // Last: thickened strokes (stretched pictures), more for bigger HUDs.
+    const passes = [[false, 0], [true, 0], [false, 1], ...(run[3] >= 20 ? [[false, 2]] : [])];
+    for (const [diagonal, thicken] of passes) {
+      const box = locateReadout(img, run, reader, diagonal, thicken);
       // Only accept a spot whose numbers actually read as an EXP readout,
       // so look-alikes elsewhere on screen are skipped.
       const text = box ? reader.read(crop(img, ...box)).text : null;
