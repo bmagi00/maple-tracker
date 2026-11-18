@@ -162,12 +162,20 @@ async function shareWindow() {
   try {
     // Ask for the screen's real pixels: on a Mac (Retina) browsers otherwise
     // send half-size pictures, too blurry for the game's small digits.
-    const opts = { audio: false, selfBrowserSurface: "exclude", surfaceSwitching: "include" };
+    // Open the picker on "Window"; browser tabs are refused below.
+    const opts = { audio: false, selfBrowserSurface: "exclude", surfaceSwitching: "include", preferCurrentTab: false };
+    const vopts = { frameRate: { ideal: 10, max: 30 }, displaySurface: "window" };
     let s;
-    try { s = await navigator.mediaDevices.getDisplayMedia({ ...opts, video: { frameRate: { ideal: 10, max: 30 }, resizeMode: "none" } }); }
+    try { s = await navigator.mediaDevices.getDisplayMedia({ ...opts, video: { ...vopts, resizeMode: "none" } }); }
     catch (e) {
       if (e?.name !== "OverconstrainedError" && e?.name !== "TypeError") throw e;
-      s = await navigator.mediaDevices.getDisplayMedia({ ...opts, video: { frameRate: { ideal: 10, max: 30 } } });
+      s = await navigator.mediaDevices.getDisplayMedia({ ...opts, video: vopts });
+    }
+    // A browser tab can't show the game: say so and stop.
+    if (s.getVideoTracks()[0]?.getSettings?.().displaySurface === "browser") {
+      s.getTracks().forEach(t => t.stop());
+      showStatus("That's a browser tab. Click Share game window again and pick the MapleStory window (or your entire screen).", true);
+      return;
     }
     stopSource();
     stream = s; track = s.getVideoTracks()[0];
@@ -193,12 +201,21 @@ async function openVideo(file) {
 function stopSource() {
   if (stream) stream.getTracks().forEach(t => t.stop());
   stream = track = imageCapture = null; source = null;
+  $("share").textContent = "Share game window";
+  $("stop").hidden = true;
+}
+/** The Stop sharing button: end the share and pause (the session is kept). */
+function stopSharing() {
+  if (!source) return;
+  if (source === "file") { video.pause(); video.removeAttribute("src"); video.load(); }
+  stopSource(); session.stop(); saveCurrent(); render();
 }
 
 function begin() {
   session.relocate(); session.mesoBox = null;
   session.start();
   $("share").textContent = "Share a different window";
+  $("stop").hidden = false;
   render();
 }
 
@@ -500,6 +517,7 @@ function drawOverlayCanvas(s) {
 // ---------------------------------------------------------------- controls
 function toggle() { if (!source) return; session.running ? session.stop() : session.start(); saveCurrent(); render(); }
 $("share").onclick = shareWindow;
+$("stop").onclick = stopSharing;
 $("share-2").onclick = shareWindow;
 $("toggle").onclick = toggle;
 $("reset").onclick = () => {

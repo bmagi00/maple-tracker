@@ -718,6 +718,7 @@ export class ExpTracker {
     this.CONFIRM = 3; this.REBASELINE = 20;
     this.last = null; this.req = null; this.reqPct = null; this.pending = [];
     this.rejects = 0; this.gained = 0; this.lost = 0; this.levels = 0; this.undo = null;
+    this.level = null;    // known level: worked out once, then +1 per level-up
   }
   static req(exp, pct) { return pct >= 0.5 ? exp / (pct / 100) : null; }
   static tol(...p) { return p.reduce((a, x) => a + (x ? 0.006 / x : 0), 0) + 0.001; }
@@ -726,10 +727,13 @@ export class ExpTracker {
     if (r === null || req === null) return null;
     return Math.abs(r - req) / req <= ExpTracker.tol(pct, reqPct);
   }
-  snap() { return [this.last, this.req, this.reqPct, this.gained, this.lost, this.levels]; }
-  restore(s) { [this.last, this.req, this.reqPct, this.gained, this.lost, this.levels] = s; }
+  snap() { return [this.last, this.req, this.reqPct, this.gained, this.lost, this.levels, this.level]; }
+  restore(s) { [this.last, this.req, this.reqPct, this.gained, this.lost, this.levels, this.level] = s; }
   setLast(r, newLevel = false) {
     const [exp, pct] = r; this.last = r; const q = ExpTracker.req(exp, pct);
+    // Work the level out from the amount only when the % is big enough to
+    // tell levels apart (just after a level-up, 0.3% fits several levels).
+    if (this.level === null && pct >= 2) this.level = levelFromAmount(exp, pct);
     if (newLevel) { this.req = q; this.reqPct = q ? pct : null; }
     else if (q && (this.req === null || pct > (this.reqPct || 0))) { this.req = q; this.reqPct = pct; }
   }
@@ -791,7 +795,9 @@ export class ExpTracker {
     if ((ratio !== null && ratio > 1 && ratio <= 3.5) || (ratio === null && op >= 70)) {
       this.undo = this.snap();
       if (this.req) this.gained += Math.max(0, this.req - oe);
-      this.gained += le; this.levels++; this.setLast(latest, true); return "level-up";
+      this.gained += le; this.levels++;
+      this.level = this.level !== null ? this.level + 1 : null;
+      this.setLast(latest, true); return "level-up";
     }
     return "rejected-pattern";
   }
@@ -962,7 +968,7 @@ export class Session {
     if (this.events.length > 500) this.events.shift();
   }
   currentLevel() {
-    if (this.mode === "amount" && this.exp.last) return levelFromAmount(...this.exp.last);
+    if (this.mode === "amount" && this.exp.last) return this.exp.level ?? levelFromAmount(...this.exp.last);
     if (this.mode === "pct") return this.pct.level;
     return null;
   }
@@ -1209,7 +1215,7 @@ export class Session {
       this.rates = { step, reset: this.resetCount, ...this.computeRates(el, g) };
     const { expHr, nowHr, pctHr, mesoHr } = this.rates;
     let level = null, pct = null;
-    if (this.mode === "amount" && this.exp.last) { level = levelFromAmount(...this.exp.last); pct = this.exp.last[1]; }
+    if (this.mode === "amount" && this.exp.last) { level = this.exp.level ?? levelFromAmount(...this.exp.last); pct = this.exp.last[1]; }
     if (this.mode === "pct" && this.pct.last !== null) { level = this.pct.level; pct = this.pct.last; }
     let eta = null;
     const req = level ? expToNext(level) : null, rate = nowHr || expHr;

@@ -58,5 +58,14 @@ check(`percentage tracker within 2% (${(t.gained / truth * 100 - 100).toFixed(2)
   check(`pickup tracker counts every meso once (${ft.mesos} of ${truthMesos})`, ft.mesos === truthMesos);
 }
 check("feed digit examples present", Object.keys(FEED_SEEDS).length >= 10);
+// Level-up from 98% of level 49 to 0.3% of level 50: the new level is 50
+// (from 0.3%, the amount alone would fit several levels).
+{
+  const t = new E.ExpTracker(), r49 = E.expToNext(49), r50 = E.expToNext(50);
+  const rd = (lv, p) => [Math.round(E.expToNext(lv) * p / 100), p];
+  for (const p of [98.19, 98.19, 98.19, 98.5, 99.2]) t.update(rd(49, p));
+  for (let i = 0; i < 4; i++) t.update(rd(50, 0.3));
+  check(`level after a level-up is known (${t.level})`, t.level === 50 && t.levels === 1);
+}
 console.log(fail ? `RESULT: FAIL (${fail})` : "RESULT: PASS");
 process.exit(fail ? 1 : 0);
