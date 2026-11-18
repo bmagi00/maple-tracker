@@ -59,7 +59,7 @@
         <ol class="steps">
           <li><span><strong>Share the window that shows the game.</strong> On this second computer, that's your Discord, YouTube or Twitch stream.</span></li>
           <li><span><strong>Keep the game's bottom bar in view.</strong> The tracker finds LV and EXP by itself; rates start 15 seconds later.</span></li>
-          <li><span><strong>Open your Item Inventory</strong> to track mesos. It can sit anywhere on the screen.</span></li>
+          <li><span><strong>Mesos count by themselves</strong> from the pickup messages in the bottom right. Open your Item Inventory too (anywhere on screen) for an exact total.</span></li>
         </ol>
         <button id="share-2" class="btn primary" type="button">Share game window</button>
         <p class="caution"><strong>Use this on a second device, not the PC you play on.</strong> Nexon's rules can treat screen-reading programs on the gaming PC as unauthorized third-party tools.</p>
@@ -78,7 +78,7 @@
           <p class="big" id="meso-hr">–</p>
           <p class="sub" id="meso-now">&nbsp;</p>
           <svg id="spark-meso" class="spark" viewBox="0 0 300 64" preserveAspectRatio="none" aria-hidden="true"></svg>
-          <p class="sub" id="meso-total">Open your Item Inventory window in the game to track mesos.</p>
+          <p class="sub" id="meso-total">Pick up some mesos, or open your Item Inventory for your total.</p>
         </div>
       </section>
     </div>
@@ -112,13 +112,14 @@
     </div>
   </section>
 
-  <details class="trouble">
+  <details class="trouble" id="trouble">
     <summary>Troubleshooting</summary>
     <div class="trouble-body">
       <h3>What it sees</h3>
       <div class="sees-grid">
         <figure><canvas id="see-exp" width="300" height="48"></canvas><figcaption id="see-exp-text">EXP: –</figcaption></figure>
         <figure><canvas id="see-meso" width="300" height="48"></canvas><figcaption id="see-meso-text">Mesos: –</figcaption></figure>
+        <figure class="wide"><canvas id="see-feed" width="300" height="140"></canvas><figcaption id="see-feed-text">Pickup messages: –</figcaption></figure>
       </div>
       <div class="tools">
         <button id="set-level" class="btn ghost small" type="button">Set my level</button>

@@ -2,6 +2,7 @@
 import * as E from "./engine.js";
 import { SEEDS } from "./seeds.js";
 import { MESO_SEEDS } from "./seeds-meso.js";
+import { FEED_SEEDS } from "./seeds-feed.js";
 let fail = 0;
 const check = (name, ok) => { console.log(`${ok ? "PASS" : "FAIL"}  ${name}`); if (!ok) fail++; };
 const table = { 1: 15, 5: 135, 6: 372, 10: 1716, 20: 20216, 30: 95700, 49: 655200, 50: 709716, 51: 748608, 60: 1209994, 70: 2062925, 89: 5684790 };
@@ -27,5 +28,35 @@ for (let i = 0; i < 3000; i++) {
 }
 const truth = (100 - 40) / 100 * E.expToNext(30) + (pct) / 100 * E.expToNext(31);
 check(`percentage tracker within 2% (${(t.gained / truth * 100 - 100).toFixed(2)}%)`, Math.abs(t.gained / truth - 1) < 0.02 && t.levels === 1);
+// Pickup messages: a simulated feed (newest at the bottom, 6 lines shown,
+// bright for a second then fading, bursts of several lines between looks,
+// repeated values), read 10 times a second. Every meso must count once.
+{
+  const ft = new E.FeedTracker();
+  let feed = [], truthMesos = 0, rnd2 = 11, now = 0;
+  const rand2 = () => (rnd2 = (rnd2 * 16807) % 2147483647) / 2147483647;
+  const kinds = ["exp", "party", "meso", "meso", "item"];
+  for (let step = 0; step < 3000; step++) {
+    now += 100;
+    const burst = rand2() < 0.12 ? 1 + Math.floor(rand2() * 4) : 0;
+    for (let b = 0; b < burst; b++) {
+      const type = kinds[Math.floor(rand2() * kinds.length)];
+      const value = type === "item" ? null : [10, 11, 12, 25, 3, 8][Math.floor(rand2() * 6)];
+      if (type === "meso") truthMesos += value;
+      feed.unshift({ type, value, born: now });
+    }
+    feed = feed.filter(l => now - l.born < 1500).slice(0, 6);
+    const obs = feed.map((l, slot) => {
+      const age = now - l.born, fade = age < 900 ? 1 : 1 - (age - 900) / 700;
+      const strength = 140 * fade * (slot > 3 ? 0.85 : 1);
+      if (strength < 85) return null;
+      return { slot, strength, type: l.type, value: l.value, sure: strength > 120 };
+    }).filter(Boolean);
+    ft.update(now, obs);
+  }
+  for (let k = 0; k < 30; k++) { now += 100; ft.update(now, []); }
+  check(`pickup tracker counts every meso once (${ft.mesos} of ${truthMesos})`, ft.mesos === truthMesos);
+}
+check("feed digit examples present", Object.keys(FEED_SEEDS).length >= 10);
 console.log(fail ? `RESULT: FAIL (${fail})` : "RESULT: PASS");
 process.exit(fail ? 1 : 0);

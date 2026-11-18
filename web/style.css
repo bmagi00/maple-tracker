@@ -164,6 +164,8 @@ tr:hover .del, .del:focus-visible { opacity: 1; }
 .trouble-body h3 { font: 600 16px/1.2 var(--display); color: var(--muted); margin: 0 0 10px; }
 .sees-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 .trouble figure { margin: 0; }
+.trouble .wide { grid-column: 1 / -1; }
+.trouble .wide canvas { max-height: 160px; }
 .trouble canvas { width: 100%; height: auto; max-height: 64px; object-fit: contain; image-rendering: pixelated; background: #11161e; border-radius: 8px; border: 2px solid var(--slate-700); }
 .trouble figcaption { margin-top: 6px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .tools { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
@@ -201,5 +203,6 @@ body.pip { margin: 0; background: var(--slate-800); }
 }
 @media (prefers-reduced-motion: reduce) {
   .gauge-fill { transition: none; }
-  
+}
+
 .offscreen { position: fixed; left: 0; top: 0; width: 2px; height: 2px; opacity: 0; pointer-events: none; }

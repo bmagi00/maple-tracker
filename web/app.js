@@ -3,6 +3,7 @@
 import { DigitReader, Session, crop, expToNext } from "./engine.js?v=__VERSION__";
 import { SEEDS } from "./seeds.js?v=__VERSION__";
 import { MESO_SEEDS } from "./seeds-meso.js?v=__VERSION__";
+import { FEED_SEEDS } from "./seeds-feed.js?v=__VERSION__";
 
 const $ = id => document.getElementById(id);
 const store = {
@@ -21,6 +22,7 @@ const session = new Session(hudReader, {
   level: store.get("mt.level", null),
   onLevel: lv => store.set("mt.level", lv),
   mesoReader,
+  feedReader: new DigitReader(FEED_SEEDS),
 });
 
 // -------------------------------------------------------- saved sessions
@@ -219,8 +221,11 @@ function region(frame, box) {
 // A worker keeps time even when this tab is in the background (browsers
 // slow down timers in hidden tabs, but not in workers).
 const metronome = new Worker(URL.createObjectURL(new Blob(
-  ["setInterval(() => postMessage(0), 500);"], { type: "text/javascript" })));
-let busy = false, lastSave = 0, lastFrame = null;
+  ["setInterval(() => postMessage(0), 100);"], { type: "text/javascript" })));
+let busy = false, lastSave = 0, lastFrame = null, lastHudTick = 0, lastSees = 0;
+// Ten times a second: the pickup messages appear and fade within about a
+// second and a half, and a burst can push several off the top in a moment.
+// The HUD and inventory are read twice a second.
 metronome.onmessage = async () => {
   if (busy) return;
   busy = true;
@@ -229,8 +234,10 @@ metronome.onmessage = async () => {
       const frame = await currentFrame();
       if (frame) {
         lastFrame = { w: frame.w, h: frame.h };
-        session.tick(Date.now(), box => region(frame, box));
-        drawSees(frame);
+        const now = Date.now(), get = box => region(frame, box);
+        if (now - lastHudTick >= 480) { lastHudTick = now; session.tick(now, get); }
+        session.tickFeed(now, get);
+        if (now - lastSees >= 480 && $("trouble").open) { lastSees = now; drawSees(frame); }
         frame.bitmap?.close?.();
       }
     }
@@ -249,7 +256,8 @@ metronome.onmessage = async () => {
 // --------------------------------------------------------------- display
 function drawSees(frame) {
   const last = session.log[session.log.length - 1];
-  for (const [id, box, text] of [["see-exp", session.hud?.exp, last?.text], ["see-meso", session.mesoBox, last?.mesoText]]) {
+  for (const [id, box, text] of [["see-exp", session.hud?.exp, last?.text], ["see-meso", session.mesoBox, last?.mesoText],
+                                  ["see-feed", session.feedReader?.box(), null]]) {
     const c = $(id), ctx = c.getContext("2d");
     ctx.clearRect(0, 0, c.width, c.height);
     if (!box) continue;
@@ -264,6 +272,9 @@ function drawSees(frame) {
     : last.mesoText ? `not sure yet (reads “${last.mesoText}”)` : "inventory not visible";
   $("see-exp-text").textContent = `EXP: ${expShown}`;
   $("see-meso-text").textContent = `Mesos: ${mesoShown}`;
+  const obs = session.feedObs || [];
+  $("see-feed-text").textContent = !session.feedReader?.anchor ? "Pickup messages: not found yet"
+    : `Pickup messages: ${obs.length ? obs.slice().sort((a, b) => b.slot - a.slot).map(o => o.type === "other" ? "?" : `${o.type} ${o.value ?? "?"}`).join(", ") : "none on screen"}`;
 }
 
 let statusOverride = null;
@@ -301,10 +312,12 @@ function render() {
   $("exp-now").textContent = s.nowHr ? `${fmt(s.nowHr)}/hr over the last 5 minutes` : " ";
   $("exp-total").innerHTML = s.exp !== null ? `<strong>+${fmt(s.exp)}</strong> EXP this session` : (s.needsLevel ? "Set your level to count EXP" : " ");
   rateText($("meso-hr"), s.mesoHr);
-  $("meso-now").textContent = s.mesoTotal !== null ? `Total ${fmt(s.mesoTotal)}${s.mesoVisible ? "" : " (inventory not visible)"}` : " ";
+  $("meso-now").textContent = s.mesoVisible && s.mesoTotal !== null ? `Total ${fmt(s.mesoTotal)}, read from your inventory`
+    : s.feedActive ? `Counting the pickup messages${s.mesoTotal !== null ? ` (last total seen ${fmt(s.mesoTotal)})` : ""}`
+    : s.mesoTotal !== null ? `Total ${fmt(s.mesoTotal)} (inventory not visible)` : "\u00a0";
   $("meso-total").innerHTML = s.mesos !== null
     ? `<strong>+${fmt(s.mesos)}</strong> mesos this session${s.mesoSpent ? `, ${fmt(s.mesoSpent)} spent` : ""}`
-    : "Open your Item Inventory window in the game to track mesos.";
+    : "Pick up some mesos, or open your Item Inventory for your total.";
 
   // session line
   $("clock").textContent = hms(s.elapsed);
@@ -444,7 +457,7 @@ $("teach-meso").onclick = () => askMeso();
 $("refind").onclick = () => { session.relocate(); session.mesoBox = null; showStatus("Looking for the HUD again"); };
 $("file").onchange = e => { const f = e.target.files[0]; if (f) openVideo(f); e.target.value = ""; };
 $("download").onclick = () => {
-  const cols = ["time", "text", "exp", "pct", "decision", "gained", "mesoText", "meso", "mesoDecision", "note"];
+  const cols = ["time", "text", "exp", "pct", "decision", "gained", "mesoText", "meso", "mesoDecision", "pickups", "pickupMesos", "note"];
   const esc = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
   const csv = [cols.join(","), ...session.log.map(r => cols.map(c => esc(r[c])).join(","))].join("\n");
   const a = Object.assign(document.createElement("a"), {

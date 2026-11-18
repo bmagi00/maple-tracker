@@ -491,6 +491,16 @@ export class DigitReader {
       for (const [c, list] of Object.entries(src))
         for (const v of list) this.tpl.push([c, normalized(Float32Array.from(v))]);
   }
+  /** All labels, best first: [[char, score], ...] */
+  rank(vec) {
+    const sh = shifted(vec), best = {};
+    for (const [c, t] of this.tpl) {
+      let m = -1;
+      for (const s of sh) { let d = 0; for (let i = 0; i < t.length; i++) d += s[i] * t[i]; if (d > m) m = d; }
+      if (!(c in best) || m > best[c]) best[c] = m;
+    }
+    return Object.entries(best).sort((a, b) => b[1] - a[1]);
+  }
   classify(vec) {
     if (!this.tpl.length) return ["?", 0];
     const sh = shifted(vec), best = {};
@@ -824,9 +834,12 @@ export const ACCEPTED = new Set(["gain", "same", "gain-confirmed", "jump-confirm
  *  The page calls tick(now, getFrame) on a timer. */
 export class Session {
   static RATE_START = 15;   // seconds before the first per-hour estimate
-  constructor(reader, { level = null, onLevel = () => {}, mesoReader = null } = {}) {
+  constructor(reader, { level = null, onLevel = () => {}, mesoReader = null, feedReader = null } = {}) {
     this.reader = reader; this.onLevel = onLevel; this.startLevel = level;
     this.mesoReader = mesoReader;
+    // The pickup messages (bottom right): mesos without the inventory open.
+    this.feedReader = feedReader ? new FeedReader(feedReader) : null;
+    this.feedOk = 0; this.feedObs = [];
     this.hud = null; this.status = "idle"; this.lastOk = 0; this.lastSearch = 0;
     this.mesoBox = null; this.mesoOk = 0; this.mesoSearch = 0; this.mesoSeen = false;
     this.prevUnsure = null; this.log = [];
@@ -840,6 +853,10 @@ export class Session {
     this.levelStart = null; this.pctStart = null; this.lastDecile = null;
     this.announced = false; this.lostAnnounced = false;
     this.meso = new MesoTracker();
+    // Mesos gained this session from either source: the inventory total
+    // while it's visible, the pickup messages while it isn't.
+    this.mesoGained = 0; this.mesoFromFeed = 0; this.mesoFromInv = 0; this.feedSeen = false;
+    this.pickups = new FeedTracker();
     this.exp = new ExpTracker(); this.pct = new PctTracker(this.startLevel);
     this.mode = null; this.votes = []; this.history = [];
     this.elapsedBanked = 0; this.startedAt = this.running ? Date.now() : null;
@@ -892,7 +909,7 @@ export class Session {
       pctStart: this.pctStart, pctEnd: this.currentPct(),
       exp: g === null ? null : Math.round(g),
       pctGained: this.mode === "pct" ? Math.round(this.pct.pctGained * 100) / 100 : null,
-      mesos: this.mesoSeen ? this.meso.gained : null, mesoSpent: this.meso.spent || 0,
+      mesos: this.mesoSeen || this.feedSeen ? this.mesoGained : null, mesoSpent: this.meso.spent || 0,
       levelUps: this.mode === "amount" ? this.exp.levels : this.pct.levels,
       expLost: Math.round((this.mode === "amount" ? this.exp.lost : this.pct.lost) || 0),
     };
@@ -986,13 +1003,15 @@ export class Session {
     const mrow = this.mesoReader ? this.tickMeso(now, getFrame) : null;
     const row = { time: new Date(now).toISOString(), text: text || "", exp: parsed?.[0] ?? "",
                   pct: parsed?.[1] ?? "", decision, gained: g === null ? "" : Math.round(g),
-                  mesoText: mrow?.text ?? "", meso: mrow?.value ?? "", mesoDecision: mrow?.decision ?? "" };
+                  mesoText: mrow?.text ?? "", meso: mrow?.value ?? "", mesoDecision: mrow?.decision ?? "",
+                  pickups: this.feedObs.map(o => `${o.slot}:${o.type}${o.value ?? "?"}`).join(" "), pickupMesos: this.mesoFromFeed };
     this.log.push(row); if (this.log.length > 20000) this.log.shift();
     return row;
   }
   /** The meso total, if the Item Inventory window is open. */
   tickMeso(now, getFrame) {
-    if (!this.mesoBox || (now - this.mesoOk > 4000 && now - this.mesoSearch > 4000)) {
+    if ((!this.mesoBox || now - this.mesoOk > 4000) && now - this.mesoSearch > 4000) {
+      // (a full-picture search: at most every 4 seconds)
       this.mesoSearch = now;
       const full = getFrame(null);
       const box = full ? findMeso(full, this.mesoReader) : null;
@@ -1002,18 +1021,62 @@ export class Session {
       this.mesoUnreadable = false;
       this.mesoBox = box; this.mesoOk = now;
     }
+    if (!this.mesoBox) return null;
     const img = getFrame(this.mesoBox);
     if (!img) return null;
     const r = readMeso(img, this.mesoReader), value = parseMeso(r.text);
-    if (value !== null) { this.mesoOk = now; this.mesoSeen = true; }
+    if (value !== null) {
+      // Back after being hidden while the pickups were being counted: those
+      // pickups are already in, so start again from the new total.
+      if (this.feedSeen && this.mesoOk && now - this.mesoOk > 3000) { this.meso.last = null; this.meso.pending = []; }
+      this.mesoOk = now; this.mesoSeen = true;
+    }
     const before = { gained: this.meso.gained, spent: this.meso.spent };
     const decision = this.meso.update(value, r.sure);
     if (value !== null && r.sure && ACCEPTED.has(decision)) this.mesoReader.confirm(r.glyphs);
     const fmtN = n => Math.round(n).toLocaleString("en-US");
     if (decision === "spent") this.event(now, "meso", `Spent ${fmtN(this.meso.spent - before.spent)} mesos`);
     const got = this.meso.gained - before.gained;
+    this.mesoGained += got; this.mesoFromInv += got;
     if (got >= 1000) this.event(now, "meso", `+${fmtN(got)} mesos`);
     return { text: r.text || "", value: value ?? "", decision };
+  }
+  /** Pickup messages: called often (about 10 times a second). */
+  inventoryVisible(now) { return !!this.mesoBox && now - this.mesoOk < 2500; }
+  tickFeed(now, getFrame) {
+    if (!this.running || !this.feedReader) return null;
+    const fr = this.feedReader;
+    const full = () => getFrame(null);
+    if (!fr.anchor) {
+      if (now - fr.lastSearch < 1000) return null;     // about 0.15 s of work each try
+      fr.lastSearch = now;
+      const img = full();
+      if (!img || !fr.locate(img)) return null;
+      this.event(now, "hud", "Found the pickup messages");
+    } else if (now - this.feedOk > 30000 && now - fr.lastSearch > 10000) {
+      // Nothing for a while: maybe the window moved. Look again (keep the
+      // old spot unless a new one turns up).
+      fr.lastSearch = now;
+      const keep = fr.anchor, img = full();
+      if (!img || !fr.locate(img)) fr.anchor = keep;
+    }
+    const box = fr.box(), img = box && getFrame(box);
+    if (!img) return null;
+    const obs = fr.read(img);
+    if (obs.length) this.feedOk = now;
+    this.feedObs = obs;
+    const inv = this.inventoryVisible(now), fmtN = n => Math.round(n).toLocaleString("en-US");
+    for (const ev of this.pickups.update(now, obs)) {
+      let d = 0;
+      if (ev.type === "meso" && ev.value !== null) d += ev.value;
+      if (ev.corrected?.type === "meso" && ev.corrected.value !== null) d -= ev.corrected.value;
+      if (!d) continue;
+      this.feedSeen = true;
+      if (inv) continue;                 // the inventory total counts it
+      this.mesoGained += d; this.mesoFromFeed += d;
+      if (d >= 1000) this.event(now, "meso", `+${fmtN(d)} mesos`);
+    }
+    return obs;
   }
   teachMeso(getFrame, typed) {
     const digits = String(typed).replace(/\D/g, "");
@@ -1046,7 +1109,7 @@ export class Session {
       if (old && el - old[0] >= Session.RATE_START) nowHr = (g - old[1]) / ((el - old[0]) / 3600);
     }
     const pctHr = this.mode === "pct" ? this.pct.pctGained / hrs : null;
-    const mesoHr = this.mesoSeen ? this.meso.gained / hrs : null;
+    const mesoHr = this.mesoSeen || this.feedSeen ? this.mesoGained / hrs : null;
     return { expHr, nowHr, pctHr, mesoHr };
   }
   feed(parsed) {
@@ -1079,11 +1142,13 @@ export class Session {
     const req = level ? expToNext(level) : null, rate = nowHr || expHr;
     if (req && pct !== null && rate > 0) eta = (100 - pct) / 100 * req / rate * 3600;
     else if (pct !== null && pctHr > 0) eta = (100 - pct) / pctHr * 3600;
-    const mesos = this.mesoSeen ? this.meso.gained : null;
+    const mesos = this.mesoSeen || this.feedSeen ? this.mesoGained : null;
     const mesoVisible = !!this.mesoBox && now - this.mesoOk < 6000;
+    const feedActive = !!this.feedReader?.anchor && now - this.feedOk < 60000;
     return {
       mesos, mesoHr, mesoTotal: this.meso.last,
       mesoSpent: this.meso.spent, mesoVisible, mesoTracking: !!this.mesoReader,
+      feedActive, mesoFromFeed: this.mesoFromFeed, mesoFromInv: this.mesoFromInv,
       mesoNeedsTeach: !!this.mesoUnreadable && !mesoVisible,
       running: !!this.running, status: this.status, elapsed: el, mode: this.mode,
       exp: g, expHr, nowHr, pctHr, level, pct, eta,
@@ -1092,5 +1157,497 @@ export class Session {
       lost: (this.mode === "amount" ? this.exp.lost : this.pct.lost) || 0,
       stale: this.running && now - this.lastOk > 15000,
     };
+  }
+}
+
+// ------------------------------------------------------- pickup messages
+//
+// Bottom-right of the game, the game writes a line for every pickup and
+// kill, newest at the bottom, pushing older lines up:
+//     You received EXP (+25)
+//     Bonus EXP for PARTY (+8)
+//     You have gained mesos (+11)
+// Lines are right-aligned, light text with a dark outline, see-through over
+// the map. Each stays bright for about a second, then fades out.
+
+/** Text-likeness of every pixel: bright, with a dark outline close by, and
+ *  brighter than the map behind it on that row. */
+export function feedInk(img) {
+  const { w, h, data } = img, n = w * h;
+  const L = new Float32Array(n), sat = new Float32Array(n), hue = new Float32Array(n);
+  for (let i = 0, j = 0; i < n; i++, j += 4) {
+    const r = data[j], g = data[j + 1], b = data[j + 2];
+    const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+    L[i] = mx; sat[i] = mx ? (mx - mn) / mx : 0;
+    // The game writes these lines in white or yellow: red and green about
+    // equal. Tan rock, wood and skin have much more red than green.
+    hue[i] = Math.min(1, Math.max(0, 1 - (r - g - 18) / 24));
+  }
+  // 5x5 minimum (horizontal pass, then vertical)
+  const t = new Float32Array(n), mn5 = new Float32Array(n);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let m = 255;
+    for (let k = Math.max(0, x - 2); k <= Math.min(w - 1, x + 2); k++) m = Math.min(m, L[y * w + k]);
+    t[y * w + x] = m;
+  }
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let m = 255;
+    for (let k = Math.max(0, y - 2); k <= Math.min(h - 1, y + 2); k++) m = Math.min(m, t[k * w + x]);
+    mn5[y * w + x] = m;
+  }
+  // mean along the row over 41 pixels
+  const ink = new Float32Array(n), raw = new Float32Array(n), R = 20;
+  const pre = new Float64Array(w + 1);
+  for (let y = 0; y < h; y++) {
+    const o = y * w;
+    for (let x = 0; x < w; x++) pre[x + 1] = pre[x] + L[o + x];
+    for (let x = 0; x < w; x++) {
+      const a0 = Math.max(0, x - R), a1 = Math.min(w, x + R + 1);
+      const mean = (pre[a1] - pre[a0]) / (a1 - a0);
+      const c = L[o + x] - mn5[o + x];
+      const a = Math.min(1, Math.max(0, (c - 40) / 80));
+      const b = Math.min(1, Math.max(0, (L[o + x] - mean - 10) / 50));
+      ink[o + x] = a * b * hue[o + x];
+      raw[o + x] = c;
+    }
+  }
+  return { w, h, ink, raw, sat, L };
+}
+
+/** Text lines in an ink map. The feed's lines all end at the same x, so
+ *  find that right edge first (the commonest row end), then the rows that
+ *  end there, grouped into lines. `xr` can be given once it's known. */
+export function feedLines(f, xr = null) {
+  const { w, h, ink, raw } = f, T = 0.4;
+  // Columns lit in most rows are borders and edges, not text: skip them.
+  const colRows = new Int32Array(w);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (ink[y * w + x] > T) colRows[x]++;
+  const skip = new Uint8Array(w);
+  for (let x = 0; x < w; x++) if (colRows[x] > 0.35 * h) for (let k = Math.max(0, x - 1); k <= Math.min(w - 1, x + 1); k++) skip[k] = 1;
+  const at = (x, y) => !skip[x] && ink[y * w + x] > T;
+  const rowEnd = new Int32Array(h).fill(-1), rowCount = new Int32Array(h);
+  for (let y = 0; y < h; y++) {
+    let c = 0;
+    for (let x = 0; x < w; x++) if (at(x, y)) { c++; rowEnd[y] = x; }
+    rowCount[y] = c;
+  }
+  if (xr === null) {
+    // Candidate edges: the commonest row ends. Keep the one whose lines end
+    // in a bracket, like "(+25)".
+    const hist = new Float32Array(w);
+    for (let y = 0; y < h; y++) if (rowCount[y] >= 3 && rowEnd[y] >= 0) hist[rowEnd[y]] += 1;
+    const sm = new Float32Array(w);
+    for (let x = 0; x < w; x++) for (let k = Math.max(0, x - 3); k <= Math.min(w - 1, x + 3); k++) sm[x] += hist[k];
+    const peaks = [];
+    for (let x = 0; x < w; x++) if (sm[x] >= 6 && (x === 0 || sm[x] >= sm[x - 1]) && (x === w - 1 || sm[x] > sm[x + 1])) peaks.push([sm[x], x]);
+    peaks.sort((a, b) => b[0] - a[0]);
+    let best = { xr: null, lines: [], score: 0 };
+    for (const [, px] of peaks.slice(0, 5)) {
+      let m = 0, c = 0;
+      for (let k = Math.max(0, px - 3); k <= Math.min(w - 1, px + 3); k++) { m += k * hist[k]; c += hist[k]; }
+      const r = feedLines(f, Math.round(m / c));
+      const th = feedTextHeight(r.lines);
+      const score = th ? r.lines.filter(l => feedEnd(f, l, th)).length : 0;
+      if (score > best.score) best = { ...r, score };
+    }
+    return best;
+  }
+  // rows whose ink ends near the edge (a ')' is a few pixels wide)
+  const near = new Uint8Array(h);
+  for (let y = 0; y < h; y++) {
+    let c = 0;
+    for (let x = Math.max(0, xr - 8); x <= Math.min(w - 1, xr + 3); x++) if (at(x, y)) c++;
+    near[y] = c > 0 ? 1 : 0;
+  }
+  const bands = [];
+  for (let y = 0; y < h;) {
+    if (!near[y]) { y++; continue; }
+    let e = y;
+    while (e + 1 < h && near[e + 1]) e++;
+    bands.push([y, e + 1]); y = e + 1;
+  }
+  const lines = [];
+  for (const [y0, y1] of bands) {
+    const bh = y1 - y0;
+    if (bh < 6 || bh > 60) continue;
+    const col = new Int32Array(w);
+    for (let y = y0; y < y1; y++) for (let x = 0; x <= Math.min(w - 1, xr + 3); x++) if (at(x, y)) col[x]++;
+    let x1 = Math.min(w - 1, xr + 3);
+    while (x1 >= 0 && col[x1] < 1) x1--;
+    if (x1 < 0) continue;
+    let x0 = x1, gap = 0;
+    for (let x = x1; x >= 0; x--) {
+      if (col[x] >= 1) { x0 = x; gap = 0; } else if (++gap > 0.9 * bh) break;
+    }
+    if (x1 - x0 < 3 * bh) continue;
+    let s = 0, c = 0, st = 0;
+    for (let y = y0; y < y1; y++) for (let x = x0; x <= x1; x++) if (at(x, y)) { s += raw[y * w + x]; st += f.sat[y * w + x]; c++; }
+    lines.push({ y0, y1, x0, x1: x1 + 1, strength: c ? s / c : 0, sat: c ? st / c : 0, ink: c });
+  }
+  return { xr, lines };
+}
+
+/** The right-aligned text in rows y0..y1 ending near x = xr, or null. */
+export function feedLineAt(f, y0, y1, xr) {
+  const { w, h, ink, raw } = f, T = 0.4;
+  y0 = Math.max(0, Math.round(y0)); y1 = Math.min(h, Math.round(y1));
+  const bh = y1 - y0;
+  if (bh < 4) return null;
+  const col = new Int32Array(w);
+  for (let y = y0; y < y1; y++) for (let x = 0; x <= Math.min(w - 1, xr + 3); x++) if (ink[y * w + x] > T) col[x]++;
+  let c = 0;
+  for (let x = Math.max(0, xr - 6); x <= Math.min(w - 1, xr + 3); x++) c += col[x];
+  if (c < Math.max(3, 0.25 * bh)) return null;          // nothing ends here
+  let x1 = Math.min(w - 1, xr + 3);
+  while (x1 >= 0 && col[x1] < 1) x1--;
+  let x0 = x1, gap = 0;
+  for (let x = x1; x >= 0; x--) { if (col[x] >= 1) { x0 = x; gap = 0; } else if (++gap > 0.9 * bh) break; }
+  if (x1 - x0 < 3 * bh) return null;
+  let s = 0, n = 0, st = 0;
+  for (let y = y0; y < y1; y++) for (let x = x0; x <= x1; x++) if (ink[y * w + x] > T) { s += raw[y * w + x]; st += f.sat[y * w + x]; n++; }
+  return { y0, y1, x0, x1: x1 + 1, strength: n ? s / n : 0, sat: n ? st / n : 0, ink: n };
+}
+
+/** Typical text height of feed lines (bracket height): the median band. */
+export function feedTextHeight(lines) {
+  const hs = lines.map(l => l.y1 - l.y0).filter(v => v >= 8 && v <= 40).sort((a, b) => a - b);
+  return hs.length ? hs[hs.length >> 1] : null;
+}
+
+/** The "(+N)" at the right end of a line. `th` is the feed's text height
+ *  (from its line spacing), so every line is scaled the same way.
+ *  -> {seg, boxes, open, close, inner, prefix} where open/close are the
+ *  bracket boxes, inner the boxes between them, prefix the text width in
+ *  front of the bracket divided by th. Null if it doesn't end in a bracket. */
+export function feedEnd(f, line, th) {
+  const { w, ink } = f;
+  const ya = Math.max(0, Math.round((line.y0 + line.y1) / 2 - 0.62 * th)), yb = Math.min(f.h, Math.round(ya + 1.24 * th));
+  const sh = yb - ya;
+  const xa = Math.max(line.x0, Math.round(line.x1 - 6 * th)), sw = line.x1 - xa + 1;
+  if (sw < 2 || sh < 4) return null;
+  const src = new Float32Array(sw * sh);
+  for (let y = 0; y < sh; y++) for (let x = 0; x < sw; x++) {
+    const xx = xa + x; src[y * sw + x] = xx < w ? ink[(ya + y) * w + xx] : 0;
+  }
+  const scale = NORM_H / th, bw = Math.max(1, Math.round(sw * scale)), bh = Math.round(sh * scale);
+  const band = resize(src, sw, sh, bw, bh);
+  const T = 0.35, col = new Int32Array(bw);
+  for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) if (band[y * bw + x] > T) col[x]++;
+  const boxes = [];
+  for (let x = 0; x < bw;) {
+    if (col[x] === 0) { x++; continue; }
+    const s = x; while (x < bw && col[x] > 0) x++;
+    let top = -1, bot = -1;
+    for (let y = 0; y < bh; y++) {
+      let any = false;
+      for (let k = s; k < x; k++) if (band[y * bw + k] > T) { any = true; break; }
+      if (any) { if (top < 0) top = y; bot = y; }
+    }
+    if (top >= 0 && (bot - top + 1) * (x - s) >= 9) pushSplit(s, x);
+  }
+  // Characters blurred together (a '3' touching its ')'): split a box that's
+  // too wide at its thinnest column, if that column is clearly thinner.
+  function pushSplit(s, e) {
+    if (e - s > 0.72 * NORM_H) {
+      let cut = -1, cv = Infinity, mx = 0;
+      for (let x = s; x < e; x++) mx = Math.max(mx, col[x]);
+      for (let x = s + Math.floor(0.25 * (e - s)); x <= s + Math.ceil(0.75 * (e - s)); x++) if (col[x] < cv) { cv = col[x]; cut = x; }
+      if (cut > s && cut < e - 1 && cv <= 0.4 * mx) { pushSplit(s, cut); pushSplit(cut + 1, e); return; }
+    }
+    let top = -1, bot = -1;
+    for (let y = 0; y < bh; y++) {
+      let any = false;
+      for (let k = s; k < e; k++) if (band[y * bw + k] > T) { any = true; break; }
+      if (any) { if (top < 0) top = y; bot = y; }
+    }
+    if (top >= 0 && (bot - top + 1) * (e - s) >= 9) boxes.push([s, top, e - s, bot - top + 1]);
+  }
+  const paren = b => b[3] >= 0.7 * NORM_H && b[2] <= 0.5 * NORM_H;
+  const last = boxes[boxes.length - 1];
+  if (!last || !paren(last)) return null;
+  // The '+' is the landmark: small, squarish, at mid height; '(' is the
+  // box just before it.
+  const mid = last[1] + last[3] / 2;
+  const plusLike = b => b[3] >= 0.25 * NORM_H && b[3] < 0.68 * NORM_H && b[2] >= 0.22 * NORM_H && b[2] <= 0.8 * NORM_H &&
+    Math.abs(b[1] + b[3] / 2 - mid) <= 0.22 * NORM_H;
+  let open = -1;
+  for (let i = boxes.length - 2; i >= Math.max(1, boxes.length - 9); i--) {
+    if (plusLike(boxes[i]) && paren(boxes[i - 1])) { open = i - 1; break; }
+  }
+  if (open < 0) {
+    // no '+': a line like "Lupin's Banana x1 earned. (Etc)" - '(' looks like ')'
+    const twin = b => paren(b) && Math.abs(b[3] - last[3]) <= 0.18 * NORM_H && Math.abs(b[1] - last[1]) <= 0.15 * NORM_H;
+    for (let i = boxes.length - 2; i >= Math.max(0, boxes.length - 6); i--) if (twin(boxes[i])) { open = i; break; }
+  }
+  if (open < 0) return null;
+  const inner = boxes.slice(open + 1, boxes.length - 1);
+  const prefix = ((xa - line.x0) + boxes[open][0] / scale) / th;
+  const bottom = ya + (last[1] + last[3]) / scale;     // the ')' bottom, in pixels
+  return { seg: { band, bw, bh }, boxes, open: boxes[open], close: last, inner, prefix, bottom };
+}
+
+/** Type of a feed line from the width of the text before its bracket
+ *  (in text heights), which doesn't depend on the number. */
+export function feedType(prefix, sat = null) {
+  if (prefix >= 8.6 && prefix < 10.5) return "exp";      // You received EXP (+25)
+  // Bonus EXP for PARTY (+8) is yellow, You have gained mesos (+11) white;
+  // their widths are close, so the colour decides.
+  if (prefix >= 10.5 && prefix < 14.0) {
+    if (sat !== null) return sat < 0.25 ? "meso" : "party";
+    return prefix < 12.4 ? "party" : "meso";
+  }
+  return "other";
+}
+
+/** Read one line: {type, value, sure, text}. */
+export function readFeedLine(f, line, th, reader) {
+  const e = feedEnd(f, line, th);
+  if (!e) return { type: "other", value: null, sure: false, text: "", prefix: undefined };
+  const small = e.inner.filter(b => b[3] < 0.75 * NORM_H);
+  let tall = e.inner.filter(b => b[3] >= 0.75 * NORM_H);
+  // Two digits blurred together: split at the thinnest column.
+  const split = [];
+  for (const b of tall) {
+    if (b[2] <= 0.72 * NORM_H) { split.push(b); continue; }
+    const { band, bw } = e.seg;
+    let cut = -1, cv = Infinity;
+    for (let x = b[0] + Math.floor(0.35 * b[2]); x <= b[0] + Math.ceil(0.65 * b[2]); x++) {
+      let s = 0; for (let y = b[1]; y < b[1] + b[3]; y++) s += band[y * bw + x];
+      if (s < cv) { cv = s; cut = x; }
+    }
+    split.push([b[0], b[1], cut - b[0], b[3]], [cut + 1, b[1], b[0] + b[2] - cut - 1, b[3]]);
+  }
+  tall = split;
+  let text = "", sure = tall.length > 0, letters = false;
+  const vecs = [];
+  for (const b of tall) {
+    const vec = glyphVec(e.seg, b);
+    vecs.push(vec);
+    let [c, score] = reader.classify(vec);
+    if (c === "?") {
+      // second chance for a blurry digit: the best match if it's clearly
+      // ahead (never "sure" - the tracker wants it read twice)
+      const r = reader.rank(vec);
+      if (r[0][1] >= 0.62 && r[0][1] - (r[1]?.[1] ?? 0) >= 0.03) c = r[0][0];
+      sure = false;
+    }
+    if (c === "E" || c === "t" || c === "c") letters = true;
+    text += c;
+    if (c === "?" || score < reader.SURE) sure = false;
+  }
+  let type = letters ? "item" : feedType(e.prefix, line.sat ?? null);
+  const plus = small.length >= 1 && (!tall.length || small[0][0] < tall[0][0]);
+  const value = type !== "item" && plus && /^[0-9]{1,7}$/.test(text) ? Number(text) : null;
+  if (type === "other" && value === null) sure = false;
+  return { type, value, sure: sure && value !== null, text: (plus ? "+" : "") + text, prefix: e.prefix, bottom: e.bottom, vecs };
+}
+
+/** Finds the pickup feed and reads its lines. Keeps where it is
+ *  (right edge, text height, line spacing, bottom line) once found. */
+/** Text height (bracket height) as a share of the line spacing. */
+export const FEED_TH = 0.76;
+
+export class FeedReader {
+  constructor(reader) { this.reader = reader; this.anchor = null; this.samples = []; this.lastSearch = 0; this.lastSeen = 0; }
+  /** Search the lower right of the picture for the feed. */
+  locate(full) {
+    const rx = Math.floor(full.w * 0.5), ry = Math.floor(full.h * 0.35);
+    const img = crop(full, rx, ry, full.w - rx, full.h - ry);
+    const f = feedInk(img);
+    const r = feedLines(f);
+    if (!r.xr || !r.lines.length) return null;
+    const th = feedTextHeight(r.lines);
+    if (!th) return null;
+    const read = r.lines.map(l => ({ l, r: readFeedLine(f, l, th, this.reader) }));
+    const good = read.filter(x => x.r.value !== null && x.r.type !== "other");
+    if (!good.length) return null;
+    const real = read.filter(x => x.r.prefix !== undefined);       // lines ending in brackets
+    if (!real.length) return null;
+    // Line spacing: the period of the text rows ending at the right edge
+    // (autocorrelation of the row profile), which doesn't need every line
+    // to be readable.
+    const xr = r.xr, x0 = Math.max(0, Math.round(xr - 4 * th));
+    const top = Math.max(0, Math.min(...r.lines.map(l => l.y0)) - th), bot = Math.min(f.h, Math.max(...r.lines.map(l => l.y1)) + 2 * th);
+    const p = [];
+    for (let y = top; y < bot; y++) { let c = 0; for (let x = x0; x <= Math.min(f.w - 1, xr + 2); x++) if (f.ink[y * f.w + x] > 0.4) c++; p.push(c); }
+    const mean = p.reduce((x, y) => x + y, 0) / p.length, q = p.map(v => v - mean);
+    const ac = lag => { let v = 0; for (let y = 0; y + lag < q.length; y++) v += q[y] * q[y + lag]; return v / (q.length - lag); };
+    let lag = 0, best = -Infinity;
+    for (let L = Math.ceil(0.9 * th); L <= Math.floor(2.2 * th); L++) { const v = ac(L); if (v > best) { best = v; lag = L; } }
+    let pitch = lag;
+    if (lag) { const a0 = ac(lag - 1), a2 = ac(lag + 1), d = a0 - 2 * best + a2; if (d < 0) pitch = lag + 0.5 * (a0 - a2) / d; }
+    else pitch = 1.25 * th;
+    // The bottom line: the lowest readable one, then further down while
+    // there's text one spacing lower.
+    let yb = Math.max(...real.map(x => x.r.bottom));
+    for (let n = 0; n < 3; n++) {
+      const l = feedLineAt(f, yb + pitch - 1.08 * FEED_TH * pitch, yb + pitch + 0.12 * FEED_TH * pitch, xr);
+      if (!l || readFeedLine(f, l, FEED_TH * pitch, this.reader).prefix === undefined) break;
+      yb += pitch;
+    }
+    const ys = [yb];
+    this.anchor = { xr: rx + r.xr, th: FEED_TH * pitch, pitch, yb: ry + ys[ys.length - 1], w: full.w, h: full.h };
+    this.samples = [];
+    return this.anchor;
+  }
+  /** The box the feed lives in (frame coordinates). */
+  box() {
+    const a = this.anchor; if (!a) return null;
+    const x0 = Math.max(0, Math.round(a.xr - 19 * a.th)), y0 = Math.max(0, Math.round(a.yb - 8.4 * a.pitch));
+    // a little below the bottom line too, in case the real bottom is lower
+    return [x0, y0, Math.min(a.w, Math.round(a.xr + a.th)) - x0, Math.min(a.h, Math.round(a.yb + 1.6 * a.pitch)) - y0];
+  }
+  /** Lines in a crop of box(): [{slot, type, value, sure, strength, text}].
+   *  Line k sits k line-spacings above the bottom line. */
+  read(img) {
+    const a = this.anchor, [bx, by] = this.box();
+    const f = feedInk(img), xr = Math.round(a.xr - bx);
+    let out = [];
+    for (let k = -1; k < 8; k++) {
+      const yb = a.yb - by - k * a.pitch;
+      const l = feedLineAt(f, yb - 1.08 * a.th, yb + 0.12 * a.th, xr);
+      if (!l) continue;
+      out.push({ slot: k, strength: l.strength, ...readFeedLine(f, l, a.th, this.reader) });
+    }
+    // A real line below the bottom: the bottom is lower than we thought.
+    if (out.some(o => o.slot === -1 && o.type !== "other" && o.prefix !== undefined)) {
+      a.yb += a.pitch; out.forEach(o => o.slot++);
+    }
+    out = out.filter(o => o.slot >= 0).sort((p, q) => q.slot - p.slot);
+    // Fine-tune the bottom from where the bottom line's ')' really is.
+    // (The spacing found when locating is kept: it's measured over many rows.)
+    for (const o of out) {
+      if (o.slot !== 0 || o.type === "other" || o.bottom === undefined) continue;
+      const off = by + o.bottom - a.yb;
+      if (Math.abs(off) <= 0.3 * a.pitch) a.yb += 0.1 * off;
+    }
+    if (out.length) this.lastSeen = Date.now();
+    return out;
+  }
+}
+
+/** Follows the feed's lines as new ones push them up, so every pickup is
+ *  counted once. A line keeps its place until something new arrives below
+ *  it; it is bright for about a second, then fades. Each update decides how
+ *  many new lines arrived since the last look, by which story fits best. */
+export class FeedTracker {
+  constructor() {
+    this.stack = [];          // bottom first: {type, value, reads, last, seen, miss, counted}
+    this.ref = null;          // brightness of a fresh line
+    this.cap = 99;            // most lines the game shows at once
+    this.mesos = 0; this.kills = 0; this.items = 0; this.missed = 0; this.unsure = 0;
+    this.nextId = 1;
+  }
+  fresh() { return this.ref ? 0.82 * this.ref : 0; }
+  update(now, obs) {
+    for (const o of obs) {
+      if (this.ref === null || o.strength > this.ref) this.ref = o.strength;
+      else this.ref -= (this.ref - o.strength) * 0.002;
+    }
+    const bySlot = new Map(obs.map(o => [o.slot, o]));
+    const top = obs.length ? Math.max(...obs.map(o => o.slot)) : -1;
+    // the most lines the game shows at once: learnt from what we see
+    if (obs.length) this.cap = this.cap === 99 ? top + 1 : Math.max(this.cap, top + 1);
+    const fresh = this.fresh(), events = [];
+    let k = 0;
+    const first = !this.stack.length && !this.started && obs.length > 0;
+    if (obs.length) this.started = true;
+    if (!this.stack.length) k = top + 1;
+    else {
+      let best = Infinity;
+      for (let kk = 0; kk <= Math.min(10, top + 1); kk++) {
+        let cost = 0.4 * kk;
+        for (let j = 0; j < kk; j++) {
+          const o = bySlot.get(j);
+          if (!o) cost += 2; else if (o.strength < fresh) cost += 1;
+        }
+        this.stack.forEach((t, i) => {
+          const o = bySlot.get(i + kk);
+          if (o) {
+            const sameValue = o.value !== null && t.value !== null && o.value === t.value;
+            // a faded line's type is less certain; the same number is a good sign
+            if (o.type !== "other" && t.type !== "other" && o.type !== t.type) cost += sameValue ? 0.5 : o.strength >= fresh ? 3 : 1.5;
+            if (o.value !== null && t.value !== null && o.value !== t.value) cost += o.sure && o.strength >= fresh ? 2 : 0.7;
+            // lines only fade: one that got brighter is a new line
+            const up = (o.strength - t.last) / (this.ref || 150);
+            if (up > 0.1) cost += 3; else if (up > 0.065) cost += 1.5;
+          } else if (i + kk < this.cap) {
+            cost += t.last >= fresh && now - t.seen < 700 ? 1 : 0.2;
+          }
+        });
+        // Lines above everything we know about: an old faded line is fine,
+        // but new lines only ever appear at the bottom.
+        for (const o of obs) if (o.slot >= kk + this.stack.length) cost += o.strength >= fresh ? 3 : 1;
+        if (this.debug) this.debug.push(`k${kk}=${cost.toFixed(1)}`);
+        if (cost < best - 1e-9) { best = cost; k = kk; }
+      }
+    }
+    // new lines (slot k-1 is the oldest of them)
+    const added = [];
+    for (let j = k - 1; j >= 0; j--) added.push({ id: this.nextId++, type: "other", value: null, sureValue: false,
+      reads: [], typeVotes: {}, valueVotes: {}, last: Infinity, seen: now, born: now, miss: 0, counted: false,
+      before: first });    // on screen when tracking began: picked up before it
+    this.stack = added.reverse().concat(this.stack);
+    // update every line with what's in its slot now: its type and value
+    // are a vote over all its readings (bright, sure ones count more)
+    this.stack.forEach((t, i) => {
+      const o = bySlot.get(i);
+      if (!o) { t.miss++; return; }
+      t.miss = 0; t.seen = now; t.last = o.strength;
+      if (o.strength >= fresh) t.bright = true;
+      const w = (o.sure ? 2 : 1) * (o.strength >= fresh ? 1 : 0.5);
+      if (o.type !== "other") {
+        t.typeVotes[o.type] = (t.typeVotes[o.type] || 0) + w;
+        if (o.value !== null) { const key = `${o.type}|${o.value}`; t.valueVotes[key] = (t.valueVotes[key] || 0) + w; }
+        if (o.value !== null && o.strength >= 0.95 * fresh) t.brightRead = true;
+      }
+      t.reads.push(o.value);
+      const type = Object.entries(t.typeVotes).sort((a, b) => b[1] - a[1])[0]?.[0] || "other";
+      const vals = Object.entries(t.valueVotes).filter(([k]) => k.startsWith(type + "|")).sort((a, b) => b[1] - a[1]);
+      t.type = type;
+      t.value = vals.length ? Number(vals[0][0].split("|")[1]) : null;
+      t.sureValue = vals.length > 0 && vals[0][1] >= 2.5;
+      if (t.before) return;
+      if (t.counted) { const ev = this.recount(t); if (ev) events.push(ev); }
+      else if (t.type === "item" ? (t.typeVotes.item || 0) >= 1.5 : (t.sureValue && t.type !== "other")) events.push(this.count(t, false));
+    });
+    // lines that have faded away: drop from the top
+    while (this.stack.length) {
+      const t = this.stack[this.stack.length - 1];
+      if (t.miss >= 2 || now - t.seen > 3000) {
+        this.stack.pop();
+        if (!t.counted && !t.before) {
+          // Count a doubtful line only if it was seen bright (new lines are);
+          // a line only ever seen faded is an old one seen again.
+          // ...and only if its number had real support: one sure, bright
+          // reading or two that agree. A one-off blurry reading is dropped.
+          const support = t.value === null ? 0 : (t.valueVotes[`${t.type}|${t.value}`] || 0);
+          if (t.type !== "other" && (t.type === "item" || (support >= 2 && t.brightRead))) events.push(this.count(t, true));
+          else if (t.bright && t.type !== "other") this.missed++;
+        }
+      } else break;
+    }
+    return events.filter(Boolean);
+  }
+  /** Add a line to the totals (remembering what was added). */
+  count(t, unsure) {
+    t.counted = { type: t.type, value: t.value };
+    if (unsure) this.unsure++;
+    this.apply(t.type, t.value, +1);
+    return { id: t.id, type: t.type, value: t.value, unsure };
+  }
+  /** A counted line whose vote changed: take back the old, add the new. */
+  recount(t) {
+    const c = t.counted;
+    if (c.type === t.type && c.value === t.value) return null;
+    if (t.type !== "item" && !t.sureValue) return null;
+    this.apply(c.type, c.value, -1); this.apply(t.type, t.value, +1);
+    t.counted = { type: t.type, value: t.value };
+    return { id: t.id, type: t.type, value: t.value, corrected: c };
+  }
+  apply(type, value, sign) {
+    if (type === "meso" && value !== null) this.mesos += sign * value;
+    if (type === "exp") this.kills += sign;
+    if (type === "item") this.items += sign;
   }
 }
