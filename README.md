@@ -16,7 +16,9 @@ itself. Shows EXP/hour, your recent pace, level, % and time to next level.
 **[Open Maple Tracker](https://bmagi00.github.io/maple-tracker/)** in Chrome or Edge on your second
 device, click **Share game window**, and pick the window showing your stream. It finds the HUD
 by itself and shows EXP/hour, mesos/hour (keep the Item Inventory window open in the game),
-your level, % and time to next level. **Pop out** gives a small always-on-top window.
+your level, % and time to next level, and the items you pick up (named with
+[maplestory.io](https://maplestory.io)'s item list, with the map read from the minimap).
+**Pop out** gives a small always-on-top window.
 Everything runs in the tab; nothing is uploaded.
 
 ## Download the Windows app

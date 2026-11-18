@@ -67,5 +67,18 @@ check("feed digit examples present", Object.keys(FEED_SEEDS).length >= 10);
   for (let i = 0; i < 4; i++) t.update(rd(50, 0.3));
   check(`level after a level-up is known (${t.level})`, t.level === 50 && t.levels === 1);
 }
+// Item names: drawn from the glyph pictures, a line of text matches its own
+// drawing better than a look-alike name.
+{
+  const { GLYPHS } = await import("./glyphs.js");
+  const render = E.atlasRenderer(GLYPHS), w = render.measure("Mushroom Spore");
+  const M = new E.LootMatcher(render);
+  M.setItems([["Mushroom Spore"], ["Red Snail Shell"], ["Squishy Liquid"], ["Tree Branch"]].map(([name], i) => ({ id: i, name, type: "Etc" })));
+  // the drawing itself, doubled in size like a screen picture, as the line
+  const r = render("Squishy Liquid x1 earned. (Etc)"), bw = r.w * 2, bh = r.h * 2, band = new Float32Array(bw * bh);
+  for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) band[y * bw + x] = r.a[(y >> 1) * r.w + (x >> 1)];
+  const got = M.identify([E.bandLook({ band, bw, bh })]);
+  check(`item names from glyph pictures (${Math.round(w)}px, read "${got?.name}")`, Math.abs(w - 94) < 2 && got?.name === "Squishy Liquid" && got.item);
+}
 console.log(fail ? `RESULT: FAIL (${fail})` : "RESULT: PASS");
 process.exit(fail ? 1 : 0);

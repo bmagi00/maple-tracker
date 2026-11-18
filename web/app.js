@@ -1,6 +1,7 @@
 // Maple Tracker - the page. Captures a shared window (or a video file),
 // hands frames to the engine twice a second, and shows the numbers.
-import { DigitReader, Session, crop, expToNext } from "./engine.js?v=__VERSION__";
+import { DigitReader, Session, LootMatcher, MapMatcher, LOOT_TYPES, atlasRenderer, crop, expToNext } from "./engine.js?v=__VERSION__";
+import { GLYPHS } from "./glyphs.js?v=__VERSION__";
 import { SEEDS } from "./seeds.js?v=__VERSION__";
 import { MESO_SEEDS } from "./seeds-meso.js?v=__VERSION__";
 import { FEED_SEEDS } from "./seeds-feed.js?v=__VERSION__";
@@ -25,12 +26,74 @@ const session = new Session(hudReader, {
   feedReader: new DigitReader(FEED_SEEDS),
 });
 
+// ------------------------------------------------------------ item names
+// Item names and icons for MapleStory Classic (MCW/1) come from
+// maplestory.io, fetched by your browser and kept for a week.
+const ITEMS_KEY = "mt.items.v1", ITEMS_URL = "https://maplestory.io/api/MCW/1/item";
+const iconUrl = id => `https://maplestory.io/api/MCW/1/item/${id}/icon`;
+/** Draw text the way the game does (12px Arial; bold for the map name),
+ *  from pictures of each letter: the same on every computer. */
+const renderText = atlasRenderer(GLYPHS);
+function useItems(list) { lootMatcher.setItems(list.map(([id, name, t]) => ({ id, name, type: LOOT_TYPES[t] }))); }
+async function loadItems() {
+  const cached = store.get(ITEMS_KEY, null);
+  if (cached) useItems(cached.list);
+  // checked again twice a day: game patches add items (and the list
+  // on maplestory.io catches up with them)
+  if (cached && Date.now() - cached.at < 12 * 36e5) return;
+  try {
+    const res = await fetch(ITEMS_URL);
+    if (!res.ok) throw new Error(res.status);
+    const list = [];
+    for (const it of await res.json()) {
+      const t = LOOT_TYPES.indexOf(it.typeInfo?.overallCategory), sub = it.typeInfo?.subCategory;
+      // things that can drop: no cash-shop items, hair or faces
+      if (t < 0 || it.isCash || sub === "Hair" || sub === "Face" || !it.name?.trim()) continue;
+      list.push([it.id, it.name.trim(), t]);
+    }
+    store.set(ITEMS_KEY, { at: Date.now(), list });
+    useItems(list);
+  } catch { /* offline or blocked: items count as "Unknown item" */ }
+}
+
+// Map names (street and map) for reading the minimap, and what has
+// dropped on each map before (kept in this browser).
+const MAPS_KEY = "mt.maps.v1", MAPS_URL = "https://maplestory.io/api/MCW/1/map", MAP_LOOT_KEY = "mt.mapLoot";
+session.mapMemory = store.get(MAP_LOOT_KEY, {});
+function useMaps(list) { mapMatcher.setMaps(list.map(([id, street, name]) => ({ id, street, name }))); }
+async function loadMaps() {
+  const cached = store.get(MAPS_KEY, null);
+  if (cached) useMaps(cached.list);
+  if (cached && Date.now() - cached.at < 12 * 36e5) return;
+  try {
+    const res = await fetch(MAPS_URL);
+    if (!res.ok) throw new Error(res.status);
+    const data = await res.json(), list = [];
+    for (const m of Array.isArray(data) ? data : data.items || data.maps || []) {
+      const name = (m.name ?? m.mapName ?? "").trim(), street = (m.streetName ?? m.street ?? "").trim();
+      if (name) list.push([m.id ?? m.mapId ?? null, street, name]);
+    }
+    if (!list.length) throw new Error("no maps");
+    store.set(MAPS_KEY, { at: Date.now(), list });
+    useMaps(list);
+  } catch { /* offline or blocked: loot is remembered per session only */ }
+}
+const lootMatcher = session.lootMatcher = new LootMatcher(renderText);
+const mapMatcher = session.mapMatcher = new MapMatcher(renderText, t => renderText.measure(t, true));
+loadItems(); loadMaps();
+function saveMapMemory() {
+  if (!session.mapMemoryDirty) return;
+  session.mapMemoryDirty = false;
+  store.set(MAP_LOOT_KEY, session.mapMemory);
+}
+
 // -------------------------------------------------------- saved sessions
 const SESS_KEY = "mt.sessions";
 let saved = store.get(SESS_KEY, []);
 let lastSessionSave = 0;
 /** Save (or update) the current session in the history. */
 function saveCurrent() {
+  saveMapMemory();
   const r = session.record();
   lastSessionSave = Date.now();
   if (!r || r.played < 30) return;
@@ -73,8 +136,10 @@ function renderSessions() {
       [expTxt, "num exp-cell"], [s.exp !== null && hrs > 0 ? compact(s.exp / hrs) : "–", "num"],
       [s.mesos !== null ? `+${compact(s.mesos)}` : "–", "num meso-cell"],
       [s.mesos !== null && hrs > 0 ? compact(s.mesos / hrs) : "–", "num"],
+      [s.loot?.length ? String(s.loot.reduce((a, e) => a + e[1], 0)) : "–", "num"],
     ];
     for (const [text, cls] of cells) { const td = document.createElement("td"); td.textContent = text; if (cls) td.className = cls; tr.append(td); }
+    if (s.loot?.length) tr.children[7].title = s.loot.slice(0, 12).map(([name, n]) => `${n} × ${name}`).join("\n");
     const tag = (td, cls, text) => td.append(Object.assign(document.createElement("span"), { className: `tag ${cls}`, textContent: text }));
     if (s.current) tag(tr.children[0], "now", "Now");
     if (best && s.id === best.id) tag(tr.children[4], "best", "Best");
@@ -376,6 +441,7 @@ function render() {
 
   document.body.classList.toggle("idle", !source && !s.elapsed);
   renderTrail(s);
+  renderLoot(s);
   renderLog();
   if (Date.now() - (render.sessionsAt || 0) > 5000) { render.sessionsAt = Date.now(); renderSessions(); }
   document.title = s.running && s.expHr ? `${fmt(s.expHr)} EXP/hr · Maple Tracker` : "Maple Tracker";
@@ -411,6 +477,30 @@ function askLevel(label = "What level is your character right now?") {
     return null;
   });
 }
+// ------------------------------------------------------------------ loot
+let lootDrawn = "";
+function renderLoot(s) {
+  const list = s.loot || [], sig = `${s.map}|` + list.map(e => `${e.name}:${e.count}`).join("|");
+  if (sig === lootDrawn) return;
+  lootDrawn = sig;
+  const total = list.reduce((a, e) => a + e.count, 0);
+  $("loot-count").textContent = [s.map, total ? `${total} item${total > 1 ? "s" : ""}` : ""].filter(Boolean).join(", ");
+  $("loot-empty").hidden = !!list.length;
+  $("loot-list").replaceChildren(...list.map(e => {
+    const li = document.createElement("li");
+    const pic = document.createElement("span"); pic.className = "loot-pic";
+    if (e.id) {
+      const img = Object.assign(document.createElement("img"), { src: iconUrl(e.id), alt: "", loading: "lazy", width: 32, height: 32 });
+      img.onerror = () => img.remove();
+      pic.append(img);
+    } else pic.textContent = "?";
+    const name = Object.assign(document.createElement("span"), { className: "loot-name", textContent: e.name });
+    const n = Object.assign(document.createElement("span"), { className: "loot-n", textContent: `×${e.count.toLocaleString()}` });
+    li.append(pic, name, n);
+    return li;
+  }));
+}
+
 // ---------------------------------------------------------------- pop-out
 // ------------------------------------------------------------ pop-out
 // A small always-on-top window to lay over the game on one screen.
@@ -510,10 +600,11 @@ $("reset").onclick = () => {
   render(); renderSessions();
 };
 $("sessions-csv").onclick = () => {
-  const cols = ["start", "end", "played_s", "level_start", "level_end", "pct_start", "pct_end", "exp", "pct_gained", "exp_per_hr", "mesos", "mesos_per_hr", "mesos_spent", "level_ups", "exp_lost"];
+  const cols = ["start", "end", "played_s", "level_start", "level_end", "pct_start", "pct_end", "exp", "pct_gained", "exp_per_hr", "mesos", "mesos_per_hr", "mesos_spent", "level_ups", "exp_lost", "items", "maps"];
   const rows = saved.map(s => [new Date(s.start).toISOString(), new Date(s.end).toISOString(), s.played, s.levelStart, s.levelEnd,
     s.pctStart, s.pctEnd, s.exp, s.pctGained, s.exp !== null && s.played ? Math.round(s.exp / (s.played / 3600)) : "",
-    s.mesos, s.mesos !== null && s.played ? Math.round(s.mesos / (s.played / 3600)) : "", s.mesoSpent, s.levelUps, s.expLost]);
+    s.mesos, s.mesos !== null && s.played ? Math.round(s.mesos / (s.played / 3600)) : "", s.mesoSpent, s.levelUps, s.expLost,
+    (s.loot || []).map(([name, n]) => `${n} ${name}`).join("; "), (s.maps || []).join("; ")]);
   const esc = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
   const csv = [cols.join(","), ...rows.map(r => r.map(esc).join(","))].join("\n");
   const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(new Blob([csv], { type: "text/csv" })), download: "maple-tracker-sessions.csv" });

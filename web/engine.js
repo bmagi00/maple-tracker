@@ -963,6 +963,48 @@ export class MesoTracker {
 export const ACCEPTED = new Set(["gain", "same", "gain-confirmed", "jump-confirmed", "baseline",
                                  "level-up", "death", "undo"]);
 
+/** Was line b (born later) the line a, found again? a was lost young (lines
+ *  stay about 5 s), just as b turned up: a line still on screen would have
+ *  kept its own track. */
+function sameLine(a, b) {
+  return b.born >= a.born && a.seen <= b.born + 1000 && b.born - a.seen < 2000 && a.seen - a.born < 6000;
+}
+/** Two lines of the same length in the same picture are two lines (the
+ *  same item twice). A track briefly following a neighbouring line of
+ *  another length proves nothing. */
+function together(a, b) {
+  // (only while each was being read: a track can drift onto a neighbour
+  // of about the same length later on)
+  const span = x => { const ts = (x.looks || []).map(l => l.at).filter(v => v !== undefined); return ts.length ? [Math.min(...ts) - 150, Math.max(...ts) + 150] : [-Infinity, Infinity]; };
+  const [a0, a1] = span(a), [b0, b1] = span(b);
+  // (and only readings as long as the line itself: another message can be
+  // within a few percent of it)
+  const own = (x, x0, x1) => { const ws = (x.frames || []).filter(f => f[0] >= x0 && f[0] <= x1).map(f => f[1]).sort((p, q) => p - q); return ws.length ? ws[ws.length >> 1] : 0; };
+  const wa = own(a, a0, a1), wb = own(b, b0, b1);
+  if (!wa || Math.abs(wa - wb) > 0.015 * wb) return false;
+  const fa = new Map((a.frames || []).filter(f => f[0] >= a0 && f[0] <= a1 && Math.abs(f[1] - wa) <= 0.015 * wa).map(f => [f[0], f[1]]));
+  return (b.frames || []).some(([t, w]) => t >= b0 && t <= b1 && Math.abs(w - wb) <= 0.015 * wb && fa.has(t));
+}
+/** Is line b brighter at its start than the line a was when last seen?
+ *  Lines only fade, so then b is a new line, not a found again. */
+function fresher(as, b, ref) {
+  const fb = (b.frames || []).slice(0, 3), w = fb.length ? fb[0][1] : 0;
+  if (!fb.length || fb[0][2] === undefined) return false;
+  let last = null, at = -Infinity;
+  for (const a of as) for (const f of a.frames || []) {
+    if (f[0] > b.born || f[2] === undefined || Math.abs(f[1] - w) > 0.05 * w) continue;
+    if (f[0] > at) { at = f[0]; last = f; }
+  }
+  if (!last) return false;
+  // (the brightest of the old line's last few readings)
+  let s = 0;
+  for (const a of as) for (const f of a.frames || []) if (f[2] !== undefined && f[0] <= at && f[0] >= at - 300 && Math.abs(f[1] - w) <= 0.05 * w) s = Math.max(s, f[2]);
+  // (b must stay that bright: a track that started on a neighbouring line
+  // proves nothing)
+  if (fb.length < 2 || Math.abs(fb[1][1] - w) > 0.04 * w) return false;
+  return Math.min(fb[0][2], fb[1][2]) - s > 0.05 * ref;
+}
+
 /** Ties it together: finds the HUD in frames, reads it, feeds a tracker.
  *  The page calls tick(now, getFrame) on a timer. */
 export class Session {
@@ -976,6 +1018,10 @@ export class Session {
     this.hud = null; this.status = "idle"; this.lastOk = 0; this.lastSearch = 0;
     this.mesoBox = null; this.mesoOk = 0; this.mesoSearch = 0; this.mesoSeen = false;
     this.prevUnsure = null; this.log = [];
+    // The map, from the minimap title; read again after the screen goes
+    // dark (changing maps). mapMemory: what has dropped on each map.
+    this.map = null; this.mapStale = true; this.mapDark = false; this.mapNext = 0; this.mapTries = 0;
+    this.frameSize = null; this.mapMemory = {}; this.mapMemoryDirty = false;
     this.reset();
   }
   reset() {
@@ -990,6 +1036,9 @@ export class Session {
     // while it's visible, the pickup messages while it isn't.
     this.mesoGained = 0; this.mesoFromFeed = 0; this.mesoFromInv = 0; this.feedSeen = false;
     this.pickups = new FeedTracker();
+    // Items picked up this session: name -> {name, id, type, count}
+    this.loot = new Map(); this.lootPending = []; this.lootRecent = []; this.lootKs = []; this.itemsSeen = 0;
+    this.mapsVisited = new Set(this.map ? [this.map.name] : []);
     this.exp = new ExpTracker(); this.pct = new PctTracker(this.startLevel);
     this.mode = null; this.votes = []; this.history = [];
     this.elapsedBanked = 0; this.startedAt = this.running ? Date.now() : null;
@@ -1045,8 +1094,11 @@ export class Session {
       mesos: this.mesoSeen || this.feedSeen ? this.mesoGained : null, mesoSpent: this.meso.spent || 0,
       levelUps: this.mode === "amount" ? this.exp.levels : this.pct.levels,
       expLost: Math.round((this.mode === "amount" ? this.exp.lost : this.pct.lost) || 0),
+      loot: this.lootList().map(e => [e.name, e.count, e.id]),
+      maps: [...this.mapsVisited],
     };
   }
+  lootList() { return [...this.loot.values()].sort((a, b) => b.count - a.count || a.name.localeCompare(b.name)); }
   /** Turn a tracker decision into session-log entries. */
   noteDecision(now, decision, lostBefore) {
     const fmtN = n => Math.round(n).toLocaleString("en-US");
@@ -1090,6 +1142,7 @@ export class Session {
   /** getFrame(box|null) -> image of that box (or the whole frame). */
   tick(now, getFrame) {
     if (!this.running) return null;
+    this.tickMap(now, getFrame);
     const lost = now - this.lastOk > 6000;
     if (lost && this.hud && !this.lostAnnounced) {
       this.lostAnnounced = true;
@@ -1099,6 +1152,7 @@ export class Session {
       this.status = "searching"; this.lastSearch = now;
       const full = getFrame(null);
       if (!full) { this.miss = "No picture from the shared window yet."; return null; }
+      this.frameSize = [full.w, full.h];
       const why = {};
       const hud = findHud(full, this.reader, why);
       this.selfShare = !hud && looksLikeTracker(full);
@@ -1202,6 +1256,8 @@ export class Session {
     this.feedObs = obs;
     const inv = this.inventoryVisible(now), fmtN = n => Math.round(n).toLocaleString("en-US");
     for (const ev of this.pickups.update(now, obs)) {
+      if (ev.type === "item" && !ev.corrected) this.lootPending.push({ t: ev.track, at: now });
+      if (ev.corrected?.type === "item" && ev.type !== "item") this.unloot(ev.track);
       let d = 0;
       if (ev.type === "meso" && ev.value !== null) d += ev.value;
       if (ev.corrected?.type === "meso" && ev.corrected.value !== null) d -= ev.corrected.value;
@@ -1211,7 +1267,126 @@ export class Session {
       this.mesoGained += d; this.mesoFromFeed += d;
       if (d >= 1000) this.event(now, "meso", `+${fmtN(d)} mesos`);
     }
+    this.nameLoot(now);
     return obs;
+  }
+  /** Is the picture dark all over (the fade between maps)? */
+  isDark(getFrame) {
+    if (!this.frameSize) return false;
+    const [W, H] = this.frameSize, S = Math.max(8, Math.round(W / 40));
+    for (const fx of [0.3, 0.5, 0.7]) for (const fy of [0.3, 0.6]) {
+      const img = getFrame([Math.round(W * fx - S / 2), Math.round(H * fy - S / 2), S, S]);
+      if (!img) return false;
+      let sum = 0;
+      for (let i = 0; i < img.data.length; i += 4) sum += img.data[i] + img.data[i + 1] + img.data[i + 2];
+      if (sum / (img.data.length / 4) / 3 > 24) return false;
+    }
+    return true;
+  }
+  /** Read the map's name once; again after a map change. */
+  tickMap(now, getFrame) {
+    if (!this.mapMatcher) return;
+    if (this.isDark(getFrame)) { this.mapDark = true; return; }
+    if (this.mapDark) {                 // the fade is over: a new map, most likely
+      this.mapDark = false; this.mapStale = true; this.mapTries = 0; this.mapNext = now + 1200;
+    }
+    if (!this.mapStale || !this.mapMatcher.ready || now < this.mapNext) return;
+    const full = getFrame(null);
+    const mm = full && findMinimap(full), looks = mm && minimapTitle(full, mm);
+    const r = looks && this.mapMatcher.identify(looks);
+    this.mapLast = { found: !!mm, looks: looks ? looks.map(l => l.n) : null, r: r && { name: r.name, cost: r.cost, margin: r.margin } };
+    if (r && r.cost < MapMatcher.COST_MAX) {
+      this.mapStale = false;
+      const changed = !this.map || this.map.name !== r.name || this.map.street !== r.street;
+      this.map = r; this.mapsVisited.add(r.name);
+      if (changed) this.event(now, "map", `On ${r.name}`);
+    } else {
+      // no minimap in view (or unreadable): try a few more times, then rarely
+      this.mapTries++;
+      this.mapNext = now + (this.mapTries < 4 ? 3000 : 30000);
+    }
+  }
+  mapKey() { return this.map ? `${this.map.street}|${this.map.name}` : null; }
+  /** Items this session, and ones seen on this map before: likelier. */
+  /** The size item lines are drawn at, once a few clear readings agree. */
+  lootScale() {
+    const ks = [...(this.lootKs || [])].sort((a, b) => a - b);
+    return ks.length >= 3 ? ks[ks.length >> 1] : null;
+  }
+  likelyLoot() {
+    // name -> how much likelier (in naming cost per look)
+    const known = new Map(), add = (name, n) => known.set(name, Math.max(known.get(name) || 0, n >= 3 ? 0.04 : n >= 2 ? 0.03 : 0.02));
+    for (const [name, e] of this.loot) add(name, e.count || 1);
+    for (const [name, n] of Object.entries(this.mapMemory[this.mapKey()] || {})) add(name, typeof n === "number" ? n : 1);
+    known.delete("Unknown item");
+    return known;
+  }
+  /** Name picked-up items once their line has been seen a few times (or
+   *  has gone). Lines that can't be named count as "Unknown item". */
+  nameLoot(now, all = false) {
+    let budget = all ? Infinity : 1;          // naming takes a while: one per tick
+    // ...and not while new lines are arriving: keep up with those first
+    const busy = !all && this.pickups.stack.some(t => now - t.born < 700);
+    this.lootPending = this.lootPending.filter(p => {
+      if (budget <= 0 || (busy && now - p.at < 5000)) return true;
+      const looks = p.t.looks || [];
+      const gone = !this.pickups.stack.includes(p.t);
+      if (!all && !gone && looks.length < 3 && now - p.at < 1500) return true;
+      if (p.t.type !== "item") return false;    // turned out to be EXP or mesos
+      budget--;
+      const r = this.lootMatcher?.ready && looks.length ? this.lootMatcher.identify(looks.slice(0, 3).map(l => l.look), this.likelyLoot(), this.lootScale()) : null;
+      if (globalThis.LOOT_DEBUG) globalThis.LOOT_DEBUG.push({ now, looks, r, t: p.t });
+      if ((this.lootTrail ||= []).length > 200) this.lootTrail.shift();
+      this.lootTrail.push([Math.round((p.t.born - (this.startedAt || 0)) / 100) / 10, r ? `${r.item ? (r.ok ? r.name : "?") : "-"} ${r.cost.toFixed(2)} k${r.ks.join("/")}` : "none"]);
+      // Not an item line after all ("You received EXP"), or no item looks
+      // like it: leave it out rather than guess.
+      if (!r || !r.item || !r.ok) return false;
+      // New pickup lines arrive bright; one only ever seen faded is an old
+      // line found again. And a faded look can't tell close names apart.
+      if (!p.t.bright) return false;
+      const ref = this.pickups.ref || 0;
+      if (r.margin < 0.01 && looks[0] && looks[0].s < 0.8 * ref) return false;
+      // one glimpse that only just picks a name: too little to go on
+      if (looks.length === 1 && r.margin < 0.03) return false;
+      // a poor fit that barely picks one name over another: a guess
+      if (r.cost > 0.87 && r.margin < 0.05) return false;
+      if (looks.length === 1 && r.cost > 0.75 && r.margin < 0.05) return false;
+      // The same line seen again: the pickup tracker sometimes loses a line
+      // and finds it once more. Same name, the old one gone young just as
+      // this one appeared: one pickup, not two.
+      // Each line counted so far keeps the tracks that followed it; a line
+      // is never in two places in one picture.
+      const t = p.t, dup = this.lootRecent.find(q => q.name === r.name &&
+        q.ts.some(m => sameLine(m, t) || sameLine(t, m)) && !q.ts.some(m => together(m, t)) && !fresher(q.ts, t, ref));
+      if (globalThis.LOOT_DEBUG) t.why = this.lootRecent.filter(q => q.name === r.name).map(q => [q.ts[0].born, q.ts.some(m => sameLine(m, t) || sameLine(t, m)), q.ts.some(m => together(m, t)), fresher(q.ts, t, ref)]);
+      if (dup) {
+        if (globalThis.LOOT_DEBUG) t.dupOf = dup.ts[0].born;
+        dup.ts.push(t); if (dup.ts.length > 12) dup.ts.shift();
+        return false;
+      }
+      this.lootRecent.push({ ts: [t], name: r.name });
+      if (this.lootRecent.length > 30) this.lootRecent.shift();
+      // a clear reading teaches the size item lines are drawn at here
+      if (r.cost < 0.62 && r.margin > 0.04) { this.lootKs.push(r.k); if (this.lootKs.length > 9) this.lootKs.shift(); }
+      const e = this.loot.get(r.name) || { name: r.name, id: r.id, type: r.type, count: 0 };
+      e.count++; this.loot.set(r.name, e); this.itemsSeen++;
+      t.lootName = r.name;
+      if (this.map) {                           // remember what drops here
+        const mem = (this.mapMemory[this.mapKey()] ||= {});
+        mem[r.name] = (mem[r.name] || 0) + 1; this.mapMemoryDirty = true;
+      }
+      return false;
+    });
+  }
+  unloot(t) {
+    this.lootPending = this.lootPending.filter(p => p.t !== t);
+    const e = t.lootName && this.loot.get(t.lootName);
+    if (e) {
+      e.count--; this.itemsSeen--; if (e.count <= 0) this.loot.delete(t.lootName);
+      const mem = this.mapMemory[this.mapKey()];
+      if (mem?.[t.lootName]) { if (--mem[t.lootName] <= 0) delete mem[t.lootName]; this.mapMemoryDirty = true; }
+      t.lootName = null;
+    }
   }
   /** EXP, % and mesos per hour at elapsed time `el` (seconds). */
   computeRates(el, g) {
@@ -1270,6 +1445,7 @@ export class Session {
       levels: this.mode === "amount" ? this.exp.levels : this.pct.levels,
       lost: (this.mode === "amount" ? this.exp.lost : this.pct.lost) || 0,
       stale: this.running && now - this.lastOk > 15000,
+      loot: this.lootList(), itemsSeen: this.itemsSeen, map: this.map ? this.map.name : null,
     };
   }
 }
@@ -1402,18 +1578,21 @@ export function feedLines(f, xr = null) {
 }
 
 /** The right-aligned text in rows y0..y1 ending near x = xr, or null. */
-export function feedLineAt(f, y0, y1, xr) {
+export function feedLineAt(f, y0, y1, xr, extend = false) {
   const { w, h, ink, raw } = f, T = 0.4;
   y0 = Math.max(0, Math.round(y0)); y1 = Math.min(h, Math.round(y1));
   const bh = y1 - y0;
   if (bh < 4) return null;
-  const col = new Int32Array(w);
-  for (let y = y0; y < y1; y++) for (let x = 0; x <= Math.min(w - 1, xr + 3); x++) if (ink[y * w + x] > T) col[x]++;
+  const col = new Int32Array(w), xmax = Math.min(w - 1, Math.round(xr + 2 * bh));
+  for (let y = y0; y < y1; y++) for (let x = 0; x <= xmax; x++) if (ink[y * w + x] > T) col[x]++;
   let c = 0;
   for (let x = Math.max(0, xr - 6); x <= Math.min(w - 1, xr + 3); x++) c += col[x];
   if (c < Math.max(3, 0.25 * bh)) return null;          // nothing ends here
   let x1 = Math.min(w - 1, xr + 3);
   while (x1 >= 0 && col[x1] < 1) x1--;
+  // The right edge can be found a few pixels short: let a line run on
+  // past it while its letters continue (else "(Etc)" loses its end).
+  for (let x = x1 + 1, gap = 0; x <= xmax; x++) { if (col[x] >= 1) { x1 = x; gap = 0; } else if (++gap > 0.35 * bh) break; }
   let x0 = x1, gap = 0;
   for (let x = x1; x >= 0; x--) { if (col[x] >= 1) { x0 = x; gap = 0; } else if (++gap > 0.9 * bh) break; }
   if (x1 - x0 < 3 * bh) return null;
@@ -1438,7 +1617,7 @@ export function maskBorders(f, run = 0.6 * f.h) {
 
 /** The line spacing: autocorrelation of how much text ends near the right
  *  edge, row by row, in rows top..bot. Null if there's no clear period. */
-export function feedPitch(f, xr, th, top = 0, bot = f.h) {
+export function feedPitch(f, xr, th, top = 0, bot = f.h, rows = null) {
   const x0 = Math.max(0, Math.round(xr - 4 * th)), p = [];
   for (let y = top; y < bot; y++) { let c = 0; for (let x = x0; x <= Math.min(f.w - 1, xr + 2); x++) if (f.ink[y * f.w + x] > 0.4) c++; p.push(c); }
   if (p.length < 3 * th) return null;
@@ -1452,6 +1631,23 @@ export function feedPitch(f, xr, th, top = 0, bot = f.h) {
   for (let i = 1; i < acs.length - 1; i++) {
     const [L, v] = acs[i];
     if (v >= 0.8 * best && v >= acs[i - 1][1] && v >= acs[i + 1][1]) { lag = L; best = v; break; }
+  }
+  // Text lines whose rows we know (they end in brackets) must sit whole
+  // spacings apart: a patterned wall behind the text can fake a spacing.
+  if (rows && rows.length >= 2) {
+    const fits = P => {
+      let sc = 0;
+      for (let i = 0; i < rows.length; i++) for (let j = i + 1; j < rows.length; j++) {
+        const d = Math.abs(rows[i] - rows[j]) / P, k = Math.round(d);
+        if (d < 0.5) continue;
+        sc += k >= 1 && Math.abs(d - k) < 0.15 ? 1 : -1;
+      }
+      return sc;
+    };
+    const peaks = acs.filter(([, v], i) => i > 0 && i < acs.length - 1 && v >= 0.3 * best && v >= acs[i - 1][1] && v >= acs[i + 1][1]);
+    let bestP = null;
+    for (const [L, v] of peaks) { const sc = fits(L); if (!bestP || sc > bestP.sc || (sc === bestP.sc && v > bestP.v)) bestP = { L, v, sc }; }
+    if (bestP && bestP.L !== lag && bestP.sc > fits(lag)) { lag = bestP.L; best = bestP.v; }
   }
   const a0 = ac(lag - 1), a2 = ac(lag + 1), d = a0 - 2 * best + a2;
   return d < 0 ? lag + 0.5 * (a0 - a2) / d : lag;
@@ -1551,7 +1747,12 @@ export function feedType(prefix, sat = null) {
 /** Read one line: {type, value, sure, text}. */
 export function readFeedLine(f, line, th, reader, aspect = 1) {
   const e = feedEnd(f, line, th);
-  if (!e) return { type: "other", value: null, sure: false, text: "", prefix: undefined };
+  if (!e) {
+    // No "(+123)" found at the end. A long line can still be an item
+    // ("Steel Sylvia x1 earned. (Equip)"): let the item reader judge it.
+    const long = (line.x1 - line.x0) / th / aspect >= 13;
+    return { type: long ? "item" : "other", weak: long, value: null, sure: false, text: "", prefix: undefined };
+  }
   const small = e.inner.filter(b => b[3] < 0.75 * NORM_H);
   let tall = e.inner.filter(b => b[3] >= 0.75 * NORM_H);
   // Two digits blurred together: split at the thinnest column.
@@ -1588,9 +1789,18 @@ export function readFeedLine(f, line, th, reader, aspect = 1) {
   // narrower than its height says: measure in unstretched units.
   let type = letters ? "item" : feedType(e.prefix / aspect, line.sat ?? null);
   const plus = small.length >= 1 && (!tall.length || small[0][0] < tall[0][0]);
-  const value = type !== "item" && plus && /^[0-9]{1,7}$/.test(text) ? Number(text) : null;
+  let value = type !== "item" && plus && /^[0-9]{1,7}$/.test(text) ? Number(text) : null;
+  // Longer before the bracket than any EXP or meso message, and no number
+  // in it: an item ("Green Napoleon x1 earned. (Equip)"). The item reader
+  // checks the line's end itself.
+  if (type === "other" && value === null && e.prefix / aspect > 14.2) type = "item";
+  // No "+" before the first digit-sized letter: the brackets hold a word,
+  // not a number ("Stirge Wing x1 earned. (Etc)" is as long as a meso
+  // line). Most likely an item; a weak guess.
+  let weak = false;
+  if ((type === "meso" || type === "party" || type === "exp") && (!plus || !tall.length)) { type = "item"; weak = true; }
   if (type === "other" && value === null) sure = false;
-  return { type, value, sure: sure && value !== null, text: (plus ? "+" : "") + text, prefix: e.prefix, bottom: e.bottom, vecs };
+  return { type, value, weak, sure: sure && value !== null, text: (plus ? "+" : "") + text, prefix: e.prefix, bottom: e.bottom, vecs };
 }
 
 /** Finds the pickup feed and reads its lines. Keeps where it is
@@ -1618,7 +1828,7 @@ export class FeedReader {
     // (which doesn't need every line to be readable).
     const xr = r.xr;
     const top = Math.max(0, Math.min(...r.lines.map(l => l.y0)) - th), bot = Math.min(f.h, Math.max(...r.lines.map(l => l.y1)) + 2 * th);
-    const pitch = feedPitch(f, xr, th, top, bot) || 1.25 * th;
+    const pitch = feedPitch(f, xr, th, top, bot, real.map(x => x.r.bottom)) || 1.25 * th;
     // The bottom line: the lowest readable one, then further down while
     // there's text one spacing lower.
     let yb = Math.max(...real.map(x => x.r.bottom));
@@ -1627,17 +1837,19 @@ export class FeedReader {
       if (!l || readFeedLine(f, l, FEED_TH * pitch, this.reader, this.aspect).prefix === undefined) break;
       yb += pitch;
     }
+    const xr2 = xr;
     const ys = [yb];
-    this.anchor = { xr: rx + r.xr, th: FEED_TH * pitch, pitch, yb: ry + ys[ys.length - 1], w: full.w, h: full.h };
+    this.anchor = { xr: rx + xr2, th: FEED_TH * pitch, pitch, yb: ry + ys[ys.length - 1], w: full.w, h: full.h };
     this.samples = [];
     return this.anchor;
   }
   /** The box the feed lives in (frame coordinates). */
   box() {
     const a = this.anchor; if (!a) return null;
-    const x0 = Math.max(0, Math.round(a.xr - 19 * a.th)), y0 = Math.max(0, Math.round(a.yb - 8.4 * a.pitch));
+    // wide enough for the longest lines ("Blue Sauna Ro... x1 earned. (Equip)")
+    const x0 = Math.max(0, Math.round(a.xr - 32 * a.th)), y0 = Math.max(0, Math.round(a.yb - 8.4 * a.pitch));
     // a little below the bottom line too, in case the real bottom is lower
-    return [x0, y0, Math.min(a.w, Math.round(a.xr + a.th)) - x0, Math.min(a.h, Math.round(a.yb + 1.6 * a.pitch)) - y0];
+    return [x0, y0, Math.min(a.w, Math.round(a.xr + 3 * a.th)) - x0, Math.min(a.h, Math.round(a.yb + 1.6 * a.pitch)) - y0];
   }
   /** Lines in a crop of box(): [{slot, type, value, sure, strength, text}].
    *  Line k sits k line-spacings above the bottom line. */
@@ -1650,7 +1862,11 @@ export class FeedReader {
       const yb = a.yb - by - k * a.pitch;
       const l = feedLineAt(f, yb - 1.08 * a.th, yb + 0.12 * a.th, xr);
       if (!l) continue;
-      out.push({ slot: k, strength: l.strength, ...readFeedLine(f, l, a.th, this.reader, this.aspect) });
+      const o = { slot: k, strength: l.strength, width: (l.x1 - l.x0) / a.th, ...readFeedLine(f, l, a.th, this.reader, this.aspect) };
+      // item lines: their look, to name the item (worked out only if the
+      // pickup tracker wants it: it's slow)
+      if (o.type === "item") o.lookFn = () => itemLineLook(f, l, a.th);
+      out.push(o);
     }
     // A real line below the bottom: the bottom is lower than we thought.
     if (out.some(o => o.slot === -1 && o.type !== "other" && o.prefix !== undefined)) {
@@ -1685,6 +1901,8 @@ export class FeedReader {
  *  it; it is bright for about a second, then fades. Each update decides how
  *  many new lines arrived since the last look, by which story fits best. */
 export class FeedTracker {
+  static WIDTH = true;      // use line lengths to tell lines apart
+  static DROP = 0.25;       // the most a line fades between two readings
   constructor() {
     this.stack = [];          // bottom first: {type, value, reads, last, seen, miss, counted}
     this.ref = null;          // brightness of a fresh line
@@ -1722,9 +1940,18 @@ export class FeedTracker {
             // a faded line's type is less certain; the same number is a good sign
             if (o.type !== "other" && t.type !== "other" && o.type !== t.type) cost += sameValue ? 0.5 : o.strength >= fresh ? 3 : 1.5;
             if (o.value !== null && t.value !== null && o.value !== t.value) cost += o.sure && o.strength >= fresh ? 2 : 0.7;
+            // a line keeps its length: a clearly longer or shorter one is
+            // another line (only judged while both are bright and whole)
+            if (FeedTracker.WIDTH && t.width && o.width && o.strength >= fresh && t.last >= fresh) {
+              const rel = Math.abs(o.width - t.width) / t.width;
+              if (rel > 0.08) cost += 2; else if (rel > 0.05) cost += 0.7;
+            }
             // lines only fade: one that got brighter is a new line
             const up = (o.strength - t.last) / (this.ref || 150);
             if (up > 0.1) cost += 3; else if (up > 0.065) cost += 1.5;
+            // ...and fade slowly: a bright line that went dim at once is
+            // another line
+            else if (FeedTracker.DROP && -up > FeedTracker.DROP && t.last >= fresh && now - t.seen < 400) cost += 1.5;
           } else if (i + kk < this.cap) {
             cost += t.last >= fresh && now - t.seen < 700 ? 1 : 0.2;
           }
@@ -1738,7 +1965,7 @@ export class FeedTracker {
     }
     // new lines (slot k-1 is the oldest of them)
     const added = [];
-    for (let j = k - 1; j >= 0; j--) added.push({ id: this.nextId++, type: "other", value: null, sureValue: false,
+    for (let j = k - 1; j >= 0; j--) added.push({ id: this.nextId++, bornSlot: j, type: "other", value: null, sureValue: false,
       reads: [], typeVotes: {}, valueVotes: {}, last: Infinity, seen: now, born: now, miss: 0, counted: false,
       before: first });    // on screen when tracking began: picked up before it
     this.stack = added.reverse().concat(this.stack);
@@ -1747,15 +1974,30 @@ export class FeedTracker {
     this.stack.forEach((t, i) => {
       const o = bySlot.get(i);
       if (!o) { t.miss++; return; }
-      t.miss = 0; t.seen = now; t.last = o.strength;
+      t.miss = 0; t.seen = now; t.last = o.strength; t.lastSlot = i;
+      if (o.width) { (t.frames ||= []).push([now, o.width, o.strength]); if (t.frames.length > 80) t.frames.shift(); }
+      if (o.width && o.strength >= fresh) t.width = t.width ? 0.7 * t.width + 0.3 * o.width : o.width;
       if (o.strength >= fresh) t.bright = true;
-      const w = (o.sure ? 2 : 1) * (o.strength >= fresh ? 1 : 0.5);
+      // (a guess from the line's length alone counts for less)
+      const w = (o.sure ? 2 : 1) * (o.strength >= fresh ? 1 : 0.5) * (o.weak ? 0.5 : 1);
       if (o.type !== "other") {
         t.typeVotes[o.type] = (t.typeVotes[o.type] || 0) + w;
         if (o.value !== null) { const key = `${o.type}|${o.value}`; t.valueVotes[key] = (t.valueVotes[key] || 0) + w; }
         if (o.value !== null && o.strength >= 0.95 * fresh) t.brightRead = true;
       }
       t.reads.push(o.value);
+      const iv = t.typeVotes.item || 0, ov = Math.max(t.typeVotes.exp || 0, t.typeVotes.meso || 0, t.typeVotes.party || 0);
+      if (o.lookFn && iv >= ov) {
+        // the brightest few looks of an item line, to name it
+        const L = (t.looks ||= []);
+        if (L.length < 3 || o.strength > L[L.length - 1].s + 2) {
+          const look = o.lookFn();
+          if (look) {
+            L.push({ look, s: o.strength, at: now });
+            L.sort((p, q) => q.s - p.s); if (L.length > 3) L.length = 3;
+          }
+        }
+      }
       const type = Object.entries(t.typeVotes).sort((a, b) => b[1] - a[1])[0]?.[0] || "other";
       const vals = Object.entries(t.valueVotes).filter(([k]) => k.startsWith(type + "|")).sort((a, b) => b[1] - a[1]);
       t.type = type;
@@ -1788,7 +2030,7 @@ export class FeedTracker {
     t.counted = { type: t.type, value: t.value };
     if (unsure) this.unsure++;
     this.apply(t.type, t.value, +1);
-    return { id: t.id, type: t.type, value: t.value, unsure };
+    return { id: t.id, type: t.type, value: t.value, unsure, track: t };
   }
   /** A counted line whose vote changed: take back the old, add the new. */
   recount(t) {
@@ -1797,7 +2039,7 @@ export class FeedTracker {
     if (t.type !== "item" && !t.sureValue) return null;
     this.apply(c.type, c.value, -1); this.apply(t.type, t.value, +1);
     t.counted = { type: t.type, value: t.value };
-    return { id: t.id, type: t.type, value: t.value, corrected: c };
+    return { id: t.id, type: t.type, value: t.value, corrected: c, track: t };
   }
   apply(type, value, sign) {
     if (type === "meso" && value !== null) this.mesos += sign * value;
@@ -1834,4 +2076,679 @@ export function lineGlyphs(f, line, th) {
   }
   const gaps = boxes.slice(1).map((b, i) => b[0] - (boxes[i][0] + boxes[i][2]));
   return { seg: { band, bw, bh }, boxes, gaps, scale };
+}
+
+// ------------------------------------------------------------- item names
+//
+// "Mushroom Spore x1 earned. (Etc)": the game writes item pickups in a plain
+// Arial-like font. To name the item, draw each candidate name in that font
+// and compare it, column by column, with the line on screen. The fixed end
+// (" x1 earned. (Etc)") tells the scale and where the name stops.
+
+export const LOOT_ROWS = 12;
+export const LOOT_TYPES = ["Etc", "Use", "Equip", "Setup", "Cash"];
+
+/** Rows of the x-height (top, baseline) of a line of text. */
+function xBand(a, w, h, thr) {
+  const rp = new Int32Array(h); let m = 0;
+  for (let y = 0; y < h; y++) { let c = 0; for (let x = 0; x < w; x++) if (a[y * w + x] > thr) c++; rp[y] = c; if (c > m) m = c; }
+  let top = -1, base = -1;
+  for (let y = 0; y < h; y++) if (rp[y] > 0.55 * m) { if (top < 0) top = y; base = y; }
+  return [top, base];
+}
+
+/** Each column's ink in LOOT_ROWS rows, from above the capitals to below the
+ *  descenders, measured in x-heights. -> Float32Array(w * LOOT_ROWS) */
+function columnLook(a, w, h, top, base, x0 = 0, x1 = w) {
+  const xh = base - top + 1, r0 = top - 0.6 * xh, r1 = base + 0.5 * xh, n = LOOT_ROWS * 3, cw = x1 - x0;
+  const out = new Float32Array(cw * LOOT_ROWS);
+  for (let i = 0; i < n; i++) {
+    const y = r0 + (r1 - r0) * i / (n - 1), y0 = Math.floor(y), fr = y - y0, r = Math.floor(i / 3);
+    for (const [yy, ww] of [[y0, 1 - fr], [y0 + 1, fr]]) {
+      if (yy < 0 || yy >= h || ww <= 0) continue;
+      for (let x = x0; x < x1; x++) out[(x - x0) * LOOT_ROWS + r] += ww * a[yy * w + x] / 3;
+    }
+  }
+  return out;
+}
+
+/** Columns that have ink: [first, last + 1]. */
+function inkSpan(a, w, h, thr) {
+  let x0 = w, x1 = 0;
+  for (let x = 0; x < w; x++) for (let y = 0; y < h; y++) if (a[y * w + x] > thr) { if (x < x0) x0 = x; x1 = x + 1; break; }
+  return x0 < x1 ? [x0, x1] : null;
+}
+
+/** The look of an item line on screen (from the feed's ink picture). */
+export function itemLineLook(f, line, th) {
+  const g = lineGlyphs(f, line, th), l = g && bandLook(g.seg, true);
+  if (l && globalThis.LOOT_DEBUG) l.seg = g.seg;
+  return l;
+}
+export function bandLook({ band, bw, bh }, feed = false) {
+  const span = inkSpan(band, bw, bh, 0.3);
+  if (!span) return null;
+  const [top, base] = xBand(band, bw, bh, 0.5);
+  if (top < 0 || base - top < 4) return null;
+  // A bar at either end that runs the full height of the band (a window
+  // edge beside the text) isn't text: leave it out.
+  const full = x => { let a = 0, b = 0; for (let y = 0; y < 2; y++) { a += band[y * bw + x]; b += band[(bh - 1 - y) * bw + x]; } return a > 0.5 && b > 0.5; };
+  for (let k = 0; k < 2; k++) {
+    let x = span[1] - 1; while (x > span[0] && x > span[1] - 0.6 * (base - top + 1) && !full(x)) x--;
+    if (x > span[0] + 4 && full(x)) { let z = x; while (z > span[0] && full(z)) z--; while (z > span[0]) { let c = 0; for (let y = 0; y < bh; y++) c += band[y * bw + z]; if (c > 0.3) break; z--; } span[1] = z + 1; }
+  }
+  // ...or one that reaches the bottom of the band (no letter does) and
+  // stands apart from the text: also an edge, not a letter.
+  if (feed) {
+    const low = x => { let b = 0, n = 0; for (let y = 0; y < bh; y++) { const v = band[y * bw + x]; if (v > 0.4) n++; if (y >= bh - 2) b += v; } return b > 0.5 && n >= 0.4 * bh; };
+    const ink = x => { let c = 0; for (let y = 0; y < bh; y++) c += band[y * bw + x]; return c; };
+    const faint = 0.06 * bh;                                              // (haze between letters)
+    let x = span[1] - 1; while (x > span[0] && ink(x) < faint) x--;
+    let z = x; while (z > span[0] && ink(z - 1) >= faint) z--;        // the last blob: z..x
+    let lows = 0; for (let c = z; c <= x; c++) if (low(c)) lows++;
+    if (x - z + 1 <= 0.5 * (base - top + 1) && 2 * lows >= x - z + 1) {
+      let g = z - 1; while (g > span[0] && ink(g) < faint) g--;
+      if (z - g >= 3 && g > span[0] + 4) span[1] = g + 1;
+    }
+  }
+  // Specks of the map just past either end of the text: leave them out.
+  const xh = base - top + 1, m = [];
+  for (let x = span[0]; x < span[1]; x++) { let c = 0; for (let y = 0; y < bh; y++) c += band[y * bw + x]; m.push(c); }
+  const blobs = [];
+  for (let i = 0; i < m.length;) {
+    if (m[i] < 0.3) { i++; continue; }
+    const s0 = i; let mass = 0; while (i < m.length && m[i] >= 0.3) mass += m[i++];
+    blobs.push([s0, i, mass]);
+  }
+  if (blobs.length >= 4) {
+    const med = blobs.map(b => b[2]).sort((p, q) => p - q)[blobs.length >> 1];
+    let a = 0, z = blobs.length - 1;
+    while (a < 2 && blobs[a][2] < 0.3 * med && blobs[a + 1][0] - blobs[a][1] >= 0.25 * xh) a++;
+    while (z > blobs.length - 3 && blobs[z][2] < 0.3 * med && blobs[z][0] - blobs[z - 1][1] >= 0.25 * xh) z--;
+    span[1] = span[0] + blobs[z][1]; span[0] += blobs[a][0];
+  }
+  return { n: span[1] - span[0], cols: columnLook(band, bw, bh, top, base, span[0], span[1]) };
+}
+
+function colInk(L, x) { let s = 0; for (let r = 0; r < LOOT_ROWS; r++) s += L[x * LOOT_ROWS + r]; return s; }
+function lookResample(L, n) {
+  const m = L.length / LOOT_ROWS, out = new Float32Array(n * LOOT_ROWS);
+  for (let i = 0; i < n; i++) {
+    const p = n > 1 ? i * (m - 1) / (n - 1) : 0, i0 = Math.floor(p), i1 = Math.min(i0 + 1, m - 1), w = p - i0;
+    for (let r = 0; r < LOOT_ROWS; r++) out[i * LOOT_ROWS + r] = L[i0 * LOOT_ROWS + r] * (1 - w) + L[i1 * LOOT_ROWS + r] * w;
+  }
+  return out;
+}
+/** Soften by a column each way (keeping every `every`th column). */
+function lookSoft(L, every = 1) {
+  const m = L.length / LOOT_ROWS, n = Math.ceil(m / every), out = new Float32Array(n * LOOT_ROWS);
+  for (let i = 0; i < n; i++) {
+    const c = every * i;
+    for (let r = 0; r < LOOT_ROWS; r++) {
+      let s = L[c * LOOT_ROWS + r], wsum = 1;
+      if (c > 0) { s += 0.5 * L[(c - 1) * LOOT_ROWS + r]; wsum += 0.5; }
+      if (c < m - 1) { s += 0.5 * L[(c + 1) * LOOT_ROWS + r]; wsum += 0.5; }
+      out[i * LOOT_ROWS + r] = s / 2;
+    }
+  }
+  return out;
+}
+function lookDtw(A, B, band = 4, step = 0.3) {
+  const n = A.length / LOOT_ROWS, m = B.length / LOOT_ROWS;
+  let prev = new Float64Array(m + 1).fill(Infinity), cur = new Float64Array(m + 1);
+  prev[0] = 0;
+  for (let i = 1; i <= n; i++) {
+    cur.fill(Infinity);
+    const c = i * m / n, lo = Math.max(1, Math.floor(c - band)), hi = Math.min(m, Math.floor(c + band));
+    for (let j = lo; j <= hi; j++) {
+      let d = 0;
+      for (let r = 0; r < LOOT_ROWS; r++) d += Math.abs(A[(i - 1) * LOOT_ROWS + r] - B[(j - 1) * LOOT_ROWS + r]);
+      d *= 12 / LOOT_ROWS;
+      cur[j] = d + Math.min(prev[j - 1], prev[j] + step, cur[j - 1] + step);
+    }
+    [prev, cur] = [cur, prev];
+  }
+  return prev[m] / (n + m);
+}
+
+/** Names item lines by comparing them with candidate names drawn by
+ *  `render(text) -> {w, h, a}` (a: 0-1 coverage, same baseline for all). */
+export class LootMatcher {
+  static SUFFIX_MAX = 1.86;    // fixed end "x1 earned. (Etc)" this close, or it's another line
+  static COST_MAX = 0.95;      // a name this close, or it is left out
+  static NAME_MAX = 95;        // names wider than this (pixels) are cut short
+  static CLOSE = 30;           // names compared closely, of those about as wide
+  // the other messages in the same corner, to tell them from item lines
+  static OTHER_ENDS = ["EXP (+63)", "EXP (+192)", "mesos (+70)", "mesos (+132)", "EXP (+7)", "mesos (+9)"];
+  static OTHER = ["You received EXP (+63)", "You received EXP (+192)", "You have gained mesos (+70)",
+                  "You have gained mesos (+132)"];
+
+  constructor(render) {
+    this.render = render; this.byType = {}; this.looks = new Map(); this.shown = new Map();
+    const x = render("xo");
+    [this.top, this.base] = xBand(x.a, x.w, x.h, 0.4);
+  }
+  /** items: [{id, name, type}] with type one of LOOT_TYPES. */
+  setItems(items) {
+    this.byType = {};
+    for (const it of items) {
+      const m = (this.byType[it.type] ||= new Map());
+      if (!m.has(it.name)) m.set(it.name, it.id);
+    }
+  }
+  get ready() { return Object.keys(this.byType).length > 0; }
+  /** How the game writes a name: one wider than about 93 pixels is cut
+   *  short with "..." ("Dark Stone Golem Rubble" -> "Dark Stone Gol...",
+   *  "Blue Sauna Robe" -> "Blue Sauna Ro..."). Near the limit, try both. */
+  shownAs(name) {
+    let v = this.shown.get(name);
+    if (!v) {
+      const m = this.render.measure || (t => this.render(t).w - 8), W = LootMatcher.NAME_MAX;
+      if (m(name) <= W - 3) v = [name];
+      else {
+        let k = name.length - 1;
+        while (k > 1 && m(name.slice(0, k).trimEnd() + "...") > W) k--;
+        const cut = name.slice(0, k).trimEnd() + "...";
+        v = m(name) <= W + 4 ? [name, cut] : [cut];
+      }
+      this.shown.set(name, v);
+    }
+    return v;
+  }
+  textLook(text) {
+    let l = this.looks.get(text);
+    if (!l) {
+      const r = this.render(text), span = inkSpan(r.a, r.w, r.h, 0.2);
+      l = span ? columnLook(r.a, r.w, r.h, this.top, this.base, span[0], span[1]) : new Float32Array(0);
+      this.looks.set(text, l);
+    }
+    return l;
+  }
+  /** Where the fixed end starts, its type and the scale. */
+  /** Where the fixed end starts, its type and the scale: the best few
+   *  readings (a scale can fit almost as well as the right one). */
+  /** How well a template drawn n columns wide fits the line's end. */
+  /** A drawn text stretched to n columns (kept: the same few are asked for
+   *  again and again). */
+  stretched(S, n) {
+    let m = (this.stretch ||= new WeakMap()).get(S);
+    if (!m) this.stretch.set(S, m = new Map());
+    let r = m.get(n);
+    if (!r) { r = lookResample(S, n); if (m.size > 300) m.clear(); m.set(n, r); }
+    return r;
+  }
+  fitEnd(look, S, sn, n, type = null, count = "x1") {
+    const O = look.cols, n0 = look.n;
+    if (n + 6 >= n0 || n < 8) return null;
+    const Sr = this.stretched(S, n);
+    let best = null;
+    for (let sh = 0; sh < 6; sh++) {
+      const s0 = n0 - n - sh;
+      let d = 0;
+      for (let i = 0; i < n * LOOT_ROWS; i++) d += Math.abs(O[s0 * LOOT_ROWS + i] - Sr[i]);
+      d /= n;
+      if (!best || d < best.d) best = { d, k: n / sn, start: s0, type, wide: count !== "x1" };
+    }
+    return best;
+  }
+  /** How well the line's start fits an EXP or meso message ("You have
+   *  gained mesos"), at any scale. */
+  startsLikeOther(look) {
+    const O = look.cols, n0 = look.n;
+    let best = Infinity;
+    for (const t of ["You have gained mesos", "You received EXP"]) {
+      const S = this.textLook(t), sn = S.length / LOOT_ROWS, [lo, hi, step] = this.scales();
+      for (let n = Math.round(lo * sn); n <= Math.round(hi * sn); n += step) {
+        if (n + 4 >= n0) break;
+        const Sr = this.stretched(S, n);
+        for (let sh = 0; sh < 6; sh++) {
+          let d = 0;
+          for (let i = 0; i < n * LOOT_ROWS; i++) d += Math.abs(O[sh * LOOT_ROWS + i] - Sr[i]);
+          d /= n;
+          if (d < best) best = d;
+        }
+      }
+    }
+    return best;
+  }
+  /** How well the line's end fits an EXP or meso message, at any scale. */
+  endsLikeOther(look) {
+    let best = Infinity;
+    for (const t of LootMatcher.OTHER_ENDS) {
+      const S = this.textLook(t), sn = S.length / LOOT_ROWS, [lo, hi, step] = this.scales();
+      for (let n = Math.round(lo * sn); n <= Math.round(hi * sn); n += step) {
+        const f = this.fitEnd(look, S, sn, n);
+        if (f && f.d < best) best = f.d;
+      }
+    }
+    return best;
+  }
+  /** The sizes to try text at: any, or near the size item lines have had
+   *  this session. -> [lowest, highest, step] (in drawn widths) */
+  scales() {
+    return this.kRef ? [0.92 * this.kRef, 1.08 * this.kRef, 1] : [1.3, 3.0, 2];
+  }
+  suffix(look) {
+    const fit = (S, sn, n, type, count) => this.fitEnd(look, S, sn, n, type, count);
+    const all = [];
+    if (this.kRef) {
+      // the size is known: every width near it
+      for (const type of LOOT_TYPES) for (const count of ["x1", "x14"]) {
+        const S = this.textLook(`${count} earned. (${type})`), sn = S.length / LOOT_ROWS;
+        for (let n = Math.round(0.93 * this.kRef * sn); n <= Math.round(1.07 * this.kRef * sn); n++) { const f = fit(S, sn, n, type, count); if (f) all.push(f); }
+      }
+    } else {
+    // coarse widths first, then every width near the best ones
+    const coarse = [];
+    for (const type of LOOT_TYPES) for (const count of ["x1", "x14"]) {
+      const S = this.textLook(`${count} earned. (${type})`), sn = S.length / LOOT_ROWS;
+      for (let n = Math.round(1.3 * sn); n <= Math.round(3.0 * sn); n += 3) {
+        const h = fit(S, sn, n, type, count);
+        if (h) coarse.push([h, S, sn, count]);
+      }
+    }
+    coarse.sort((p, q) => p[0].d - q[0].d);
+    for (const [h, S, sn, count] of coarse.slice(0, 8)) {
+      const n = Math.round(h.k * sn);
+      for (let m = n - 2; m <= n + 2; m++) { const f = fit(S, sn, m, h.type, count); if (f) all.push(f); }
+    }
+    }
+    all.sort((p, q) => p.d - q.d);
+    const picks = [];
+    for (const h of all) {
+      if (h.d > all[0].d * 1.15) break;
+      const sameType = picks.filter(p => p.type === h.type);
+      if (sameType.length >= 2 || picks.length >= 5) continue;
+      if (sameType.every(p => Math.abs(Math.log(p.k / h.k)) > 0.04)) picks.push(h);
+    }
+    return picks;
+  }
+  /** Where the name ends: at the space before "x1". The drawn suffix
+   *  only places it roughly (the game spaces "x1 earned." a little
+   *  differently), so look for the gap itself near there. */
+  static nameEnd(look, h, space) {
+    const guess = Math.round(h.start - h.k * space), L = look.cols;
+    const lo = Math.max(1, Math.round(guess - 6 * h.k)), hi = Math.min(look.n - 1, Math.round(h.start + 8 * h.k));
+    let best = null;
+    for (let x = lo; x < hi;) {
+      if (colInk(L, x) >= 0.05) { x++; continue; }
+      const g0 = x; while (x < hi && colInk(L, x) < 0.05) x++;
+      if (x - g0 >= 1.2 * h.k) {                         // a space, not just the gap between letters
+        const d = Math.abs(x - (h.start)) + 0.5 * Math.abs(g0 - guess);
+        if (!best || d < best.d) best = { d, e: g0 };
+      }
+    }
+    return best ? best.e : guess;
+  }
+  /** Name an item from one or more looks of its line.
+   *  -> {name, id, type, cost, margin} or null */
+  identify(looks, known = null, kRef = null) {
+    if (!this.ready || !looks.length) return null;
+    this.kRef = kRef;
+    try { return this.identify1(looks, known, kRef); } finally { this.kRef = null; }
+  }
+  identify1(looks, known, kRef) {
+    // the space before "x1", in drawn columns
+    const space = (this.textLook("a x1 earned. (Etc)").length - this.textLook("x1 earned. (Etc)").length - this.textLook("a").length) / LOOT_ROWS;
+    const parts = [];
+    for (const look of looks) {
+      let hs = this.suffix(look);
+      // Every item line in a session is drawn at the same size: a reading
+      // at some other size is the wrong reading (or not an item line).
+      if (kRef) hs = hs.filter(h => Math.abs(Math.log(h.k / kRef)) < 0.07);
+      if (hs.length) parts.push([look, hs]);
+    }
+    if (!parts.length) return null;
+    // A track can slip onto a neighbouring line for a frame or two: a look
+    // that reads as another message ("You have gained mesos (+17)") is
+    // left out, as long as most of the looks are item lines.
+    const isOther = ([look, hs]) => this.endsLikeOther(look) < hs[0].d || this.startsLikeOther(look) < 1.5;
+    const mine = parts.filter(p => !isOther(p));
+    const mixed = mine.length && 2 * mine.length >= parts.length && mine.length < parts.length;
+    if (mixed) parts.splice(0, parts.length, ...mine);
+    // The kind in brackets ("(Etc)" or "(Use)") can be a near thing on a
+    // blurry line: try each kind that fits about as well, keep the best.
+    const kinds = new Set();
+    for (const [, hs] of parts) for (const h of hs) if (h.d <= hs[0].d * 1.12) kinds.add(h.type);
+    let res = null;
+    for (const type of kinds) {
+      const r = this.identifyAs(type, parts, known, space);
+      if (r && (!res || r.cost < res.cost)) res = r;
+    }
+    // A track that wandered between lines must read clearly to count.
+    if (res && mixed && (res.cost > 0.7 || res.margin < 0.05)) res.ok = false;
+    return res;
+  }
+  identifyAs(type, parts, known, space) {
+    const names = this.byType[type];
+    if (!names) return null;
+    const totals = new Map(); let used = 0;
+    for (const [look, hs] of parts) {
+      const best = new Map();                         // per name, over the scale readings
+      let any = false;
+      for (const h of hs) {
+        if (h.type !== type) continue;
+        // the name ends a space before the "x1" (or "x14")
+        const e = LootMatcher.nameEnd(look, h, space);
+        if (e < 8) continue;
+        any = true;
+        // A speck of the map left of the name can join the line: also try
+        // starting after it.
+        const starts = [0];
+        {
+          const blobs = [];
+          for (let x = 0; x < e; x++) {
+            const v = colInk(look.cols, x);
+            if (v < 0.05) continue;
+            const last = blobs[blobs.length - 1];
+            if (last && last.x1 === x) { last.x1 = x + 1; last.m += v; } else blobs.push({ x0: x, x1: x + 1, m: v });
+          }
+          const ms = blobs.slice(0, 8).map(b => b.m).sort((p, q) => p - q), med = ms[ms.length >> 1] || 0;
+          for (let i = 0; i < 2 && i + 1 < blobs.length; i++) {
+            if (blobs[i].m >= 0.35 * med || blobs[i + 1].x0 > 0.2 * e) break;
+            starts.push(blobs[i + 1].x0);
+          }
+        }
+        const obs = starts.map(x0 => lookSoft(look.cols.subarray(x0 * LOOT_ROWS, e * LOOT_ROWS)));
+        // a reading of the end that fits less well costs a little
+        const hp = 0.5 * (h.d - hs[0].d);
+        // Every name about as wide as the line: a rough comparison at half
+        // the detail first, then a close one for the likeliest few.
+        const cands = [];
+        for (const name of names.keys()) {
+          if (!best.has(name)) best.set(name, 1.2);   // too wide or narrow: a fixed cost
+          for (const shown of this.shownAs(name)) {
+            const R = this.textLook(shown), rn = R.length / LOOT_ROWS;
+            if (!rn) continue;
+            starts.forEach((x0, i) => {
+              const wpen = Math.abs(Math.log((e - x0) / (h.k * rn)));
+              if (wpen <= 0.12) cands.push({ name, R, x0, i, extra: 2 * wpen + (i ? 0.02 : 0) + hp });
+            });
+          }
+        }
+        const half = starts.map(x0 => lookSoft(look.cols.subarray(x0 * LOOT_ROWS, e * LOOT_ROWS), 2));
+        for (const c of cands) c.d = lookDtw(half[c.i], lookSoft(lookResample(c.R, c.x0 === undefined ? e : e - c.x0), 2), 2) + c.extra;
+        cands.sort((p, q) => p.d - q.d);
+        for (const c of cands.slice(0, LootMatcher.CLOSE)) {
+          const d = lookDtw(obs[c.i], lookSoft(lookResample(c.R, e - c.x0))) + c.extra;
+          if (d < best.get(c.name)) best.set(c.name, d);
+        }
+      }
+      if (!any) continue;
+      used++;
+      for (const [name, c] of best) totals.set(name, (totals.get(name) || 0) + c);
+    }
+    if (!used) return null;
+    // Items already picked up this session or on this map are likelier.
+    // Items already picked up are likelier, the more often the likelier.
+    if (known) for (const [name, c] of totals) if (known.has(name)) totals.set(name, c - (known.get?.(name) ?? 0.02) * used);
+    const ranked = [...totals.entries()].sort((a, b) => a[1] - b[1]);
+    const [name, cost] = ranked[0], second = ranked[1] ? ranked[1][1] : Infinity;
+    const sd = parts.reduce((a, [, hs]) => a + hs[0].d, 0) / parts.length;
+    // Doesn't end in "earned. (Etc)" after all, or reads better as one of
+    // the other messages ("You received EXP (+63)"): not an item.
+    let item = sd < LootMatcher.SUFFIX_MAX;
+    // ...and its end must look more like "earned. (Etc)" than "EXP (+63)"
+    if (item) {
+      let other = 0;
+      for (const [look, hs] of parts) if (this.endsLikeOther(look) < hs[0].d || this.startsLikeOther(look) < 1.5) other++;
+      if (2 * other > parts.length) item = false;
+    }
+    if (item) {
+      const whole = (look, text) => { const R = this.textLook(text); return R.length ? lookDtw(lookSoft(look.cols), lookSoft(lookResample(R, look.n))) : 9; };
+      const shown = this.shownAs(name);
+      let asItem = 0, asOther = 0;
+      for (const [look] of parts) {
+        asItem += Math.min(...shown.map(t => whole(look, `${t} x1 earned. (${type})`)));
+        asOther += Math.min(...LootMatcher.OTHER.map(t => whole(look, t)));
+      }
+      if (asOther < asItem) item = false;
+    }
+    return { name, id: names.get(name), type, cost: cost / used, margin: (second - cost) / used, second: ranked[1]?.[0], sd, item,
+             ok: item && cost / used < LootMatcher.COST_MAX, ks: parts.map(([, hs]) => +hs[0].k.toFixed(2)),
+             k: parts.reduce((a, [, hs]) => a + hs[0].k, 0) / parts.length };
+  }
+
+}
+
+// ---------------------------------------------------------------- the map
+//
+// The minimap window (usually top left) has the street and map name under
+// its title bar: "Victoria Road" / "East Rocky Mountain III", in white
+// bold letters. Its orange WORLD button and the white title field beside
+// it are easy to find.
+
+/** Find the minimap's WORLD button and title field.
+ *  -> {button: [x, y, w, h], fieldLeft} or null */
+export function findMinimap(img) {
+  const { w, data } = img, h = Math.floor(img.h * 0.6);
+  // the WORLD button's gold
+  const m = new Uint8Array(w * h);
+  for (let i = 0, j = 0; i < w * h; i++, j += 4) {
+    const r = data[j], g = data[j + 1], b = data[j + 2];
+    if (r < 150 || r - b < 70 || g > r) continue;
+    const [H, S] = hsv(r, g, b);
+    m[i] = H >= 13 && H <= 24 && S >= 100 ? 1 : 0;      // (hue in half degrees)
+  }
+  const closed = morph(morph(m, w, h, true), w, h, false);
+  let best = null;
+  for (const c of components(closed, w, h)) {
+    const bw = c.w, bh = c.h, x = c.x, y = c.y;
+    if (bh < 7 || bh > 70 || bw / bh < 1.8 || bw / bh > 4.8 || c.area < 0.3 * bw * bh) continue;
+    // the title field: white with dark letters, left of the -/+ buttons
+    const fy = Math.round(y + bh / 2);
+    let fx = -1, white = 0, n = 0, miss = 0;
+    for (let xx = x - Math.round(1.2 * bw); xx > Math.max(0, x - 14 * bw); xx--) {
+      const i = (fy * w + xx) * 4, mn = Math.min(data[i], data[i + 1], data[i + 2]), mx = Math.max(data[i], data[i + 1], data[i + 2]);
+      const ok = mx - mn < 30 && mn > 70;     // white, or the grey "MINI MAP" letters
+      if (ok) { n++; if (mn > 200) white++; fx = xx; miss = 0; }
+      else if (n > 0 && ++miss > 0.3 * bh) break;
+    }
+    if (n < 1.5 * bw || white / n < 0.6) continue;
+    // under the title bar: the window's steel blue
+    let blue = 0, tot = 0;
+    for (let yy = Math.round(y + 2 * bh); yy < Math.min(h, y + 5 * bh); yy += 2) for (let xx = fx; xx < x; xx += 3) {
+      const i = (yy * w + xx) * 4, r = data[i], g = data[i + 1], bl = data[i + 2];
+      tot++; if (bl - r >= 25 && bl - r <= 90 && g > 130 && g < 225) blue++;
+    }
+    if (!tot || blue / tot < 0.3) continue;
+    if (!best || n > best.n) best = { button: [x, y, bw, bh], fieldLeft: fx, n };
+  }
+  return best;
+}
+
+/** The two title lines (street, then map) as looks: [street, map] or null. */
+export function minimapTitle(img, mm) {
+  const [bx, by, bw, bh] = mm.button;
+  const x0 = Math.max(0, Math.round(mm.fieldLeft - 6 * bh)), y0 = Math.round(by + 1.4 * bh);
+  const y1 = Math.min(img.h, Math.round(by + 5.6 * bh));
+  // the window is as wide as its title: look a little right of the button too
+  const x1 = Math.min(img.w, Math.round(bx + bw + 1.5 * bh));
+  const W = x1 - x0, H = y1 - y0;
+  if (W < 10 || H < 10) return null;
+  // white, unsaturated letters on the steel blue
+  const ink = new Float32Array(W * H);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = ((y0 + y) * img.w + x0 + x) * 4, r = img.data[i], g = img.data[i + 1], b = img.data[i + 2];
+    const mn = Math.min(r, g, b), mx = Math.max(r, g, b);
+    ink[y * W + x] = mx - mn < 45 ? Math.min(1, Math.max(0, (mn - 190) / 45)) : 0;
+  }
+  // window edges: columns lit from top to bottom
+  for (let x = 0; x < W; x++) {
+    let lit = 0; for (let y = 0; y < H; y++) if (ink[y * W + x] > 0.3) lit++;
+    if (lit > 0.7 * H) for (let y = 0; y < H; y++) ink[y * W + x] = 0;
+  }
+  // the two text lines: runs of rows with ink
+  const rowInk = new Float32Array(H);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) rowInk[y] += ink[y * W + x];
+  const thr = Math.max(1.5, 0.08 * Math.max(...rowInk)), bands = [];
+  for (let y = 0; y < H;) {
+    if (rowInk[y] < thr) { y++; continue; }
+    const s0 = y; let mass = 0; while (y < H && rowInk[y] >= thr) mass += rowInk[y++];
+    if (y - s0 >= 0.35 * bh) bands.push({ y0: s0, y1: y, mass });
+  }
+  if (bands.length < 2) return null;
+  const two = bands.sort((p, q) => q.mass - p.mass).slice(0, 2).sort((p, q) => p.y0 - q.y0);
+  // The emblem sits in a dark frame: text starts right of it.
+  let frame = -1;
+  {
+    const ty0 = two[0].y0, ty1 = two[1].y1;
+    for (let x = Math.floor(0.6 * W); x >= 0; x--) {
+      let dark = 0;
+      for (let y = ty0; y < ty1; y++) {
+        const i = ((y0 + y) * img.w + x0 + x) * 4;
+        if (Math.max(img.data[i], img.data[i + 1], img.data[i + 2]) < 110) dark++;
+      }
+      if (dark >= 0.4 * (ty1 - ty0)) { frame = x; break; }
+    }
+  }
+  // per line: its pieces of ink
+  const lines = two.map(bd => {
+    const lh = bd.y1 - bd.y0, col = new Float32Array(W);
+    for (let y = bd.y0; y < bd.y1; y++) for (let x = 0; x < W; x++) col[x] += ink[y * W + x];
+    const blobs = [];
+    for (let x = frame + 1; x < W;) {
+      if (col[x] < 0.3) { x++; continue; }
+      const s0 = x; let m = 0; while (x < W && col[x] >= 0.3) m += col[x++];
+      if (m >= 0.6 * lh) blobs.push([s0, x]);          // (not a stray speck)
+    }
+    if (!blobs.length) return null;
+    let a = 0, e = blobs.length - 1;
+    if (frame >= 0) {
+      // words left to right from the emblem; a wide gap ends the line
+      let k = 0; while (k + 1 < blobs.length && blobs[k + 1][0] - blobs[k][1] <= 1.6 * lh) k++;
+      e = k;
+    } else {
+      // no emblem frame seen: words right to left, up to a wide gap
+      a = e; while (a > 0 && blobs[a][0] - blobs[a - 1][1] <= 0.8 * lh) a--;
+    }
+    return { bd, lh, blobs, xa: blobs[a][0], xe: blobs[e][1] };
+  });
+  if (lines.includes(null)) return null;
+  // Both lines start at the same spot: an emblem sticking out into one
+  // line makes that one start early.
+  const start = Math.max(lines[0].xa, lines[1].xa);
+  const looks = [];
+  for (const ln of lines) {
+    const first = ln.blobs.find(b => b[1] > start + 1);
+    const xa = first ? Math.max(first[0], start) : start, xe = ln.xe;
+    const pad = Math.round(0.35 * ln.lh), ya = Math.max(0, ln.bd.y0 - pad), yb = Math.min(H, ln.bd.y1 + pad), sh = yb - ya;
+    if (xe - xa < 4) return null;
+    const band = new Float32Array((xe - xa) * sh);
+    for (let y = 0; y < sh; y++) for (let x = xa; x < xe; x++) band[y * (xe - xa) + x - xa] = ink[(ya + y) * W + x];
+    const l = bandLook({ band, bw: xe - xa, bh: sh });
+    if (!l) return null;
+    looks.push(l);
+  }
+  return looks;
+}
+
+/** Names the map from its minimap title by drawing every street and map
+ *  name (bold) and comparing, like item names. maps: [{id, street, name}] */
+export class MapMatcher {
+  static COST_MAX = 1.1;       // a name this close, or the map stays unknown
+  constructor(render, measure = null) {
+    this.render = render; this.measure = measure || (t => render(t, true).w);
+    this.maps = []; this.looks = new Map(); this.widths = new Map();
+    const x = render("xo", true);
+    [this.top, this.base] = xBand(x.a, x.w, x.h, 0.4);
+  }
+  setMaps(maps) {
+    const seen = new Set();
+    this.maps = maps.filter(m => { const k = m.street + "|" + m.name; if (!m.name || seen.has(k)) return false; seen.add(k); return true; });
+  }
+  get ready() { return this.maps.length > 0; }
+  width(t) { let w = this.widths.get(t); if (w === undefined) { w = this.measure(t); this.widths.set(t, w); } return w; }
+  textLook(t) {
+    let l = this.looks.get(t);
+    if (!l) {
+      const r = this.render(t, true), span = inkSpan(r.a, r.w, r.h, 0.2);
+      l = span ? columnLook(r.a, r.w, r.h, this.top, this.base, span[0], span[1]) : new Float32Array(0);
+      this.looks.set(t, l);
+    }
+    return l;
+  }
+  /** How well a line matches a name drawn at scale k (or stretched to fit). */
+  cost(look, text, k = null) {
+    const R = this.textLook(text), rn = R.length / LOOT_ROWS;
+    if (!rn) return 1.5;
+    const n = k ? Math.max(4, Math.round(k * rn)) : look.n;
+    const Rn = lookResample(R, n);
+    let c = lookDtw(lookSoft(look.cols), lookSoft(Rn), Math.max(4, Math.abs(n - look.n) + 3));
+    if (k) {
+      // Names often differ only at the end ("Sleepy Dungeon I" / "V"): look
+      // at the last few letters on their own as well.
+      const ta = Math.max(3, Math.round(0.22 * look.n)), tb = Math.max(3, Math.round(0.22 * n));
+      c += 0.5 * lookDtw(lookSoft(look.cols.subarray((look.n - ta) * LOOT_ROWS)), lookSoft(Rn.subarray((n - tb) * LOOT_ROWS)), Math.max(3, Math.abs(ta - tb) + 2));
+    }
+    return c;
+  }
+  /** [streetLook, mapLook] -> {id, street, name, cost, margin} or null */
+  identify([sl, nl]) {
+    if (!this.ready) return null;
+    // Both lines share one scale (even on a stretched screen), so the
+    // ratio of their widths has to match the drawn names'.
+    const ratio = nl.n / sl.n, sc = new Map(), nc = new Map();
+    const ranked = [];
+    for (const m of this.maps) {
+      const ws = this.width(m.street || " "), wn = this.width(m.name);
+      if (!ws || !wn) continue;
+      const rp = Math.abs(Math.log(ratio / (wn / ws)));
+      if (rp > 0.14) continue;
+      if (!sc.has(m.street)) sc.set(m.street, this.cost(sl, m.street));
+      // the map name drawn at the street name's scale
+      const ls = this.textLook(m.street).length / LOOT_ROWS, k = ls ? sl.n / ls : null;
+      const key = m.name + "|" + (k ? k.toFixed(2) : "");
+      if (!nc.has(key)) nc.set(key, this.cost(nl, m.name, k));
+      ranked.push([sc.get(m.street) + nc.get(key), m]);
+    }
+    if (!ranked.length) return null;
+    ranked.sort((p, q) => p[0] - q[0]);
+    const [cost, m] = ranked[0];
+    const other = ranked.find(r => r[1].name !== m.name);
+    return { ...m, cost: cost / 2, margin: other ? (other[0] - cost) / 2 : 1 };
+  }
+}
+
+// ------------------------------------------------------------ text pictures
+/** Draws text from a glyph atlas (pictures of each letter of Liberation
+ *  Sans 12px, Arial's twin): the same picture on every computer, unlike a
+ *  browser's own font drawing. -> render(text, bold) -> {w, h, a} */
+export function atlasRenderer(atlas) {
+  const cache = { regular: {}, bold: {} };
+  const glyph = (set, ch) => {
+    const c = cache[set];
+    if (!(ch in c)) {
+      const g = atlas[set].glyphs[ch] || atlas[set].glyphs["?"];
+      const [adv, x0, w, b64] = g, bin = b64 ? atob(b64) : "";
+      const data = new Float32Array(bin.length);
+      for (let i = 0; i < bin.length; i++) data[i] = bin.charCodeAt(i) / 255;
+      c[ch] = { adv, x0, w, data };
+    }
+    return c[ch];
+  };
+  // The game draws with whole-pixel letter widths and no kerning (like
+  // Windows' own Arial at 12px), which makes words a little wider.
+  const layout = (text, set) => {
+    const xs = [];
+    let pen = 0;
+    for (let i = 0; i < text.length; i++) { xs.push(pen); pen += Math.round(glyph(set, text[i]).adv); }
+    return { xs, width: pen };
+  };
+  const render = (text, bold = false) => {
+    const set = bold ? "bold" : "regular", H = atlas[set].h;
+    const { xs, width } = layout(text, set);
+    const W = Math.ceil(width) + 8, a = new Float32Array(W * H);
+    for (let i = 0; i < text.length; i++) {
+      const g = glyph(set, text[i]);
+      const ox = Math.round(4 + xs[i]) + g.x0;
+      for (let y = 0; y < H; y++) for (let x = 0; x < g.w; x++) {
+        const X = ox + x;
+        if (X >= 0 && X < W) a[y * W + X] = Math.min(1, a[y * W + X] + g.data[y * g.w + x]);
+      }
+    }
+    return { w: W, h: H, a };
+  };
+  render.measure = (text, bold = false) => layout(text, bold ? "bold" : "regular").width;
+  return render;
 }
