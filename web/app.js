@@ -160,10 +160,15 @@ async function shareWindow() {
     return;
   }
   try {
-    const s = await navigator.mediaDevices.getDisplayMedia({
-      video: { frameRate: { ideal: 10, max: 30 } }, audio: false,
-      selfBrowserSurface: "exclude", surfaceSwitching: "include",
-    });
+    // Ask for the screen's real pixels: on a Mac (Retina) browsers otherwise
+    // send half-size pictures, too blurry for the game's small digits.
+    const opts = { audio: false, selfBrowserSurface: "exclude", surfaceSwitching: "include" };
+    let s;
+    try { s = await navigator.mediaDevices.getDisplayMedia({ ...opts, video: { frameRate: { ideal: 10, max: 30 }, resizeMode: "none" } }); }
+    catch (e) {
+      if (e?.name !== "OverconstrainedError" && e?.name !== "TypeError") throw e;
+      s = await navigator.mediaDevices.getDisplayMedia({ ...opts, video: { frameRate: { ideal: 10, max: 30 } } });
+    }
     stopSource();
     stream = s; track = s.getVideoTracks()[0];
     track.addEventListener("ended", () => { stopSource(); session.stop(); saveCurrent(); render(); });
@@ -332,7 +337,7 @@ function render() {
     // after a long time, a gentle nudge (the details are in Troubleshooting).
     searchingSince ??= Date.now();
     if (session.selfShare) {
-      msg = "You're sharing the screen this tracker is on. Click \u201cShare a different window\u201d and pick the screen (or window) with MapleStory.";
+      msg = "Right now the shared screen shows this tracker, not the game. Switch back to MapleStory: tracking picks up as soon as the game is on screen (Picture-in-Picture keeps your numbers in view). With two screens, share the one with the game.";
       warn = true;
     } else msg = Date.now() - searchingSince < 120000
       ? "Kill some mobs to start tracking. It can take 30 seconds to a minute while it calibrates to MapleStory's heads-up display."

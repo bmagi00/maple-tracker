@@ -306,7 +306,8 @@ export function findHud(img, reader, why = {}) {
  *  browser is on, instead of the one with the game.) The page is mostly two
  *  slate colours that game maps don't cover so evenly. */
 export function looksLikeTracker(img) {
-  const { w, h, data } = img, near = (r, g, b, R, G, B) => Math.abs(r - R) <= 7 && Math.abs(g - G) <= 7 && Math.abs(b - B) <= 7;
+  // (generous: Mac screen capture shifts colours a little)
+  const { w, h, data } = img, near = (r, g, b, R, G, B) => Math.abs(r - R) <= 14 && Math.abs(g - G) <= 14 && Math.abs(b - B) <= 16;
   let n = 0, hit = 0;
   for (let y = 0; y < h; y += 6) for (let x = 0; x < w; x += 6) {
     const i = (y * w + x) * 4, r = data[i], g = data[i + 1], b = data[i + 2];
