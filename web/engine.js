@@ -1037,7 +1037,7 @@ export class Session {
     this.meso = new MesoTracker();
     // Mesos gained this session from either source: the inventory total
     // while it's visible, the pickup messages while it isn't.
-    this.mesoGained = 0; this.mesoFromFeed = 0; this.mesoFromInv = 0; this.feedSeen = false;
+    this.mesoGained = 0; this.mesoFromFeed = 0; this.mesoFromInv = 0; this.feedSeen = false; this.mesoRecent = [];
     this.pickups = new FeedTracker();
     // Items picked up this session: name -> {name, id, type, count}
     this.loot = new Map(); this.lootPending = []; this.lootRecent = []; this.lootKs = []; this.itemsSeen = 0; this.lootLog = [];
@@ -1265,8 +1265,22 @@ export class Session {
       if (ev.type === "item" && !ev.corrected && this.lootOn) this.lootPending.push({ t: ev.track, at: now });
       if (ev.corrected?.type === "item" && ev.type !== "item") this.unloot(ev.track);
       let d = 0;
-      if (ev.type === "meso" && ev.value !== null) d += ev.value;
-      if (ev.corrected?.type === "meso" && ev.corrected.value !== null) d -= ev.corrected.value;
+      const wasLeftOut = !!ev.track?.ignored;
+      if (ev.track) ev.track.ignored = false;
+      if (ev.type === "meso" && ev.value !== null) {
+        // A pickup many times bigger than this session's usual ones, read
+        // only a time or two, is a misread ("(+85)" with a speck after it),
+        // not a jackpot: leave it out. Read steadily, it counts.
+        const v = ev.value, usual = this.usualMeso(), votes = ev.track?.valueVotes?.[`meso|${v}`] || 0;
+        if (usual && v >= 1000 && v > 20 * usual && votes < 4) {
+          ev.track.ignored = true;
+          this.event(now, "meso", `Left out an unlikely +${fmtN(v)} mesos reading`);
+        } else {
+          d += v;
+          if (v > 0) { (this.mesoRecent ||= []).push(v); if (this.mesoRecent.length > 25) this.mesoRecent.shift(); }
+        }
+      }
+      if (ev.corrected?.type === "meso" && ev.corrected.value !== null && !wasLeftOut) d -= ev.corrected.value;
       if (!d) continue;
       this.feedSeen = true;
       if (inv) continue;                 // the inventory total counts it
@@ -1275,6 +1289,11 @@ export class Session {
     }
     this.nameLoot(now);
     return obs;
+  }
+  /** The usual meso pickup this session (once there have been a few). */
+  usualMeso() {
+    const r = [...(this.mesoRecent || [])].sort((p, q) => p - q);
+    return r.length >= 5 ? r[r.length >> 1] : null;
   }
   /** Is the picture dark all over (the fade between maps)? */
   isDark(getFrame) {
