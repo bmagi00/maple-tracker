@@ -96,12 +96,14 @@
         </div>
       </section>
 
-      <section class="win loot" aria-labelledby="loot-title">
+      <section class="win loot" id="loot" aria-labelledby="loot-title">
         <div class="win-bar">
           <h2 id="loot-title">Loot</h2>
           <p id="loot-count" class="totals"></p>
+          <label class="switch"><input type="checkbox" id="loot-on"> Track items</label>
         </div>
         <div class="win-body">
+          <p id="loot-off" class="empty">Item tracking is off. Turn it on to list the items you pick up; it uses a little more of your computer while you play.</p>
           <ul id="loot-list" class="loot-list"></ul>
           <p id="loot-empty" class="empty">Items you pick up show here, named from the pickup messages. Keep the minimap open: the tracker learns what drops on each map.</p>
           <p class="credit">Item names and icons from <a href="https://maplestory.io" target="_blank" rel="noopener">maplestory.io</a>.</p>

@@ -39,7 +39,7 @@ jobs:
       - name: Stamp the version (so browsers load the new files, not cached ones)
         run: |
           V="$(date -u +%Y%m%d-%H%M)-${GITHUB_SHA::7}"
-          sed -i "s/__VERSION__/$V/g" web/index.html web/app.js
+          sed -i "s/__VERSION__/$V/g" web/index.html web/app.js web/loot-worker.js
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

@@ -34,7 +34,19 @@ const iconUrl = id => `https://maplestory.io/api/MCW/1/item/${id}/icon`;
 /** Draw text the way the game does (12px Arial; bold for the map name),
  *  from pictures of each letter: the same on every computer. */
 const renderText = atlasRenderer(GLYPHS);
-function useItems(list) { lootMatcher.setItems(list.map(([id, name, t]) => ({ id, name, type: LOOT_TYPES[t] }))); }
+// Items new in a game patch that maplestory.io's list doesn't have yet
+// (their names as the game shows them, and the kind in brackets). Once
+// the list has an item, its entry there (with the icon) is used instead.
+const EXTRA_ITEMS = [
+  // Thanksgiving event, November 2026 patch
+  ["Pumpkin Piece", "Etc"], ["Pie Flour", "Etc"], ["Turkey Egg", "Use"],
+];
+function useItems(list) {
+  const items = list.map(([id, name, t]) => ({ id, name, type: LOOT_TYPES[t] })), have = new Set(items.map(it => it.name));
+  for (const [name, type] of EXTRA_ITEMS) if (!have.has(name)) items.push({ id: null, name, type });
+  lootMatcher.setItems(items);
+  lootWorker?.postMessage({ items });
+}
 async function loadItems() {
   const cached = store.get(ITEMS_KEY, null);
   if (cached) useItems(cached.list);
@@ -79,8 +91,28 @@ async function loadMaps() {
   } catch { /* offline or blocked: loot is remembered per session only */ }
 }
 const lootMatcher = session.lootMatcher = new LootMatcher(renderText);
+// Items are named in a worker, so reading the screen never stops for it.
+// If the worker can't start (or fails), naming happens here as before.
+const lootWorker = (() => {
+  try {
+    const w = globalThis.LOOT_WORKER_SRC     // (test builds: everything in one file)
+      ? new Worker(URL.createObjectURL(new Blob([globalThis.LOOT_WORKER_SRC], { type: "text/javascript" })))
+      : new Worker(new URL("./loot-worker.js?v=__VERSION__", import.meta.url), { type: "module" });
+    const waiting = new Map(); let next = 1;
+    const fail = () => { session.lootAsk = null; for (const f of waiting.values()) f.reject(); waiting.clear(); };
+    w.onmessage = ({ data }) => {
+      const f = waiting.get(data.id); waiting.delete(data.id);
+      if (f) data.error ? f.reject(new Error(data.error)) : f.resolve(data.r);
+    };
+    w.onerror = fail;
+    session.lootAsk = (looks, known, kRef) => new Promise((resolve, reject) => {
+      const id = next++; waiting.set(id, { resolve, reject });
+      w.postMessage({ id, looks: looks.map(l => ({ n: l.n, cols: l.cols })), known, kRef });
+    });
+    return w;
+  } catch { return null; }
+})();
 const mapMatcher = session.mapMatcher = new MapMatcher(renderText, t => renderText.measure(t, true));
-loadItems(); loadMaps();
 function saveMapMemory() {
   if (!session.mapMemoryDirty) return;
   session.mapMemoryDirty = false;
@@ -104,6 +136,23 @@ function saveCurrent() {
   renderSessions();
 }
 addEventListener("pagehide", saveCurrent);
+
+// ------------------------------------------------------- loot on or off
+// Off for someone's first session (less to take in, less work for the
+// computer); on from their second, unless they've chosen.
+const LOOT_ON_KEY = "mt.loot.on";
+let lootLoaded = false;
+function applyLoot() {
+  const pref = store.get(LOOT_ON_KEY, null);
+  const on = session.lootOn = pref !== null ? !!pref : saved.some(s => s.id !== session.id);
+  $("loot-on").checked = on;
+  $("loot").classList.toggle("off", !on);
+  $("loot-off").hidden = on;
+  if (!on) session.lootPending = [];
+  if (on && !lootLoaded) { lootLoaded = true; loadItems(); loadMaps(); }   // (the item list is only fetched when wanted)
+}
+$("loot-on").onchange = e => { store.set(LOOT_ON_KEY, e.target.checked); applyLoot(); };
+applyLoot();
 document.addEventListener("visibilitychange", () => { if (document.hidden) saveCurrent(); });
 
 const compact = n => {
@@ -279,6 +328,7 @@ function stopSharing() {
 function begin() {
   session.relocate(); session.mesoBox = null;
   session.start();
+  applyLoot();
   $("share").textContent = "Share a different window";
   $("stop").hidden = false;
   render();
@@ -618,9 +668,19 @@ $("set-level").onclick = () => askLevel();
 $("refind").onclick = () => { session.relocate(); session.mesoBox = null; showStatus("Looking for the HUD again"); };
 $("file").onchange = e => { const f = e.target.files[0]; if (f) openVideo(f); e.target.value = ""; };
 $("download").onclick = () => {
-  const cols = ["time", "text", "exp", "pct", "decision", "gained", "mesoText", "meso", "mesoDecision", "pickups", "pickupMesos", "note"];
+  const cols = ["time", "text", "exp", "pct", "decision", "gained", "mesoText", "meso", "mesoDecision", "pickups", "pickupMesos", "note",
+                "item", "itemResult", "itemDetail", "itemPicture"];
   const esc = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
-  const csv = [cols.join(","), ...session.log.map(r => cols.map(c => esc(r[c])).join(","))].join("\n");
+  // Item lines get rows of their own (the latest few hundred, kept only
+  // while this tab is open): the name given, what became of it, and a small
+  // picture of the line as read, to check the name against.
+  const items = (session.lootLog || []).map(l => ({
+    time: l.time, item: l.name, itemResult: l.verdict,
+    itemDetail: `line seen ${l.born.slice(11, 22)}; looks ${l.looks}; fit ${l.cost}; next best ${l.second} (+${l.margin})`,
+    itemPicture: l.pic,
+  }));
+  const rows = [...session.log, ...items].sort((p, q) => (p.time < q.time ? -1 : p.time > q.time ? 1 : 0));
+  const csv = [cols.join(","), ...rows.map(r => cols.map(c => esc(r[c])).join(","))].join("\n");
   const a = Object.assign(document.createElement("a"), {
     href: URL.createObjectURL(new Blob([csv], { type: "text/csv" })),
     download: `maple-tracker-readings-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-")}.csv`,

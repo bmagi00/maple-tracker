@@ -1009,6 +1009,9 @@ function fresher(as, b, ref) {
  *  The page calls tick(now, getFrame) on a timer. */
 export class Session {
   static RATE_START = 15;   // seconds before the first per-hour estimate
+  static LOOT_LOG = 300;    // item lines kept for troubleshooting (oldest dropped)
+  /** Track and name picked-up items (and read the map for them). */
+  lootOn = true;
   constructor(reader, { level = null, onLevel = () => {}, mesoReader = null, feedReader = null } = {}) {
     this.reader = reader; this.onLevel = onLevel; this.startLevel = level;
     this.mesoReader = mesoReader;
@@ -1037,7 +1040,7 @@ export class Session {
     this.mesoGained = 0; this.mesoFromFeed = 0; this.mesoFromInv = 0; this.feedSeen = false;
     this.pickups = new FeedTracker();
     // Items picked up this session: name -> {name, id, type, count}
-    this.loot = new Map(); this.lootPending = []; this.lootRecent = []; this.lootKs = []; this.itemsSeen = 0;
+    this.loot = new Map(); this.lootPending = []; this.lootRecent = []; this.lootKs = []; this.itemsSeen = 0; this.lootLog = [];
     this.mapsVisited = new Set(this.map ? [this.map.name] : []);
     this.exp = new ExpTracker(); this.pct = new PctTracker(this.startLevel);
     this.mode = null; this.votes = []; this.history = [];
@@ -1253,10 +1256,13 @@ export class Session {
     if (!img) return null;
     const obs = fr.read(img);
     if (obs.length) this.feedOk = now;
+    // Loot tracking off: item lines are still tracked (so their lines aren't
+    // mistaken for mesos), but never looked at closely or named.
+    if (!this.lootOn) for (const o of obs) delete o.lookFn;
     this.feedObs = obs;
     const inv = this.inventoryVisible(now), fmtN = n => Math.round(n).toLocaleString("en-US");
     for (const ev of this.pickups.update(now, obs)) {
-      if (ev.type === "item" && !ev.corrected) this.lootPending.push({ t: ev.track, at: now });
+      if (ev.type === "item" && !ev.corrected && this.lootOn) this.lootPending.push({ t: ev.track, at: now });
       if (ev.corrected?.type === "item" && ev.type !== "item") this.unloot(ev.track);
       let d = 0;
       if (ev.type === "meso" && ev.value !== null) d += ev.value;
@@ -1285,7 +1291,7 @@ export class Session {
   }
   /** Read the map's name once; again after a map change. */
   tickMap(now, getFrame) {
-    if (!this.mapMatcher) return;
+    if (!this.mapMatcher || !this.lootOn) return;
     if (this.isDark(getFrame)) { this.mapDark = true; return; }
     if (this.mapDark) {                 // the fade is over: a new map, most likely
       this.mapDark = false; this.mapStale = true; this.mapTries = 0; this.mapNext = now + 1200;
@@ -1321,60 +1327,94 @@ export class Session {
     known.delete("Unknown item");
     return known;
   }
+  /** For troubleshooting (in the readings CSV): what each item line was
+   *  named, how sure, what became of it, and a small picture of the line.
+   *  Only the latest few hundred are kept. */
+  noteLoot(now, t, looks, r, verdict) {
+    const l = looks[0], log = (this.lootLog ||= []);
+    log.push({ time: new Date(now).toISOString(), born: new Date(t.born).toISOString(), verdict,
+               name: r?.name ?? "", second: r?.second ?? "", cost: r ? +r.cost.toFixed(3) : "",
+               margin: r ? +r.margin.toFixed(3) : "", looks: looks.length, pic: l?.look?.pic ? l.look.pic() : "" });
+    if (log.length > Session.LOOT_LOG) log.shift();
+  }
   /** Name picked-up items once their line has been seen a few times (or
    *  has gone). Lines that can't be named count as "Unknown item". */
   nameLoot(now, all = false) {
     let budget = all ? Infinity : 1;          // naming takes a while: one per tick
     // ...and not while new lines are arriving: keep up with those first
-    const busy = !all && this.pickups.stack.some(t => now - t.born < 700);
+    // (unless the naming happens elsewhere: see lootAsk)
+    const ask = !all && this.lootAsk;
+    const busy = !all && !ask && this.pickups.stack.some(t => now - t.born < 700);
     this.lootPending = this.lootPending.filter(p => {
       if (budget <= 0 || (busy && now - p.at < 5000)) return true;
-      const looks = p.t.looks || [];
+      let looks = p.t.looks || [];
       const gone = !this.pickups.stack.includes(p.t);
       if (!all && !gone && looks.length < 3 && now - p.at < 1500) return true;
       if (p.t.type !== "item") return false;    // turned out to be EXP or mesos
       budget--;
-      const r = this.lootMatcher?.ready && looks.length ? this.lootMatcher.identify(looks.slice(0, 3).map(l => l.look), this.likelyLoot(), this.lootScale()) : null;
+      let r;
+      if (ask && this.lootMatcher?.ready && looks.length && !p.failed) {
+        // Named in the background (a worker), so reading the screen never
+        // waits for it: ask once, one line at a time, and carry on when the
+        // answer is in.
+        if (!p.asked) {
+          if (this.lootAsking) return true;
+          p.asked = looks.slice(0, 3); this.lootAsking = true;
+          ask(p.asked.map(l => l.look), this.likelyLoot(), this.lootScale())
+            .then(a => { p.answer = a ?? null; }, () => { p.failed = true; })
+            .finally(() => { this.lootAsking = false; });
+          return true;
+        }
+        if (p.answer === undefined) return true;
+        looks = p.asked; r = p.answer;
+      } else {
+        r = this.lootMatcher?.ready && looks.length ? this.lootMatcher.identify(looks.slice(0, 3).map(l => l.look), this.likelyLoot(), this.lootScale()) : null;
+      }
       if (globalThis.LOOT_DEBUG) globalThis.LOOT_DEBUG.push({ now, looks, r, t: p.t });
       if ((this.lootTrail ||= []).length > 200) this.lootTrail.shift();
       this.lootTrail.push([Math.round((p.t.born - (this.startedAt || 0)) / 100) / 10, r ? `${r.item ? (r.ok ? r.name : "?") : "-"} ${r.cost.toFixed(2)} k${r.ks.join("/")}` : "none"]);
-      // Not an item line after all ("You received EXP"), or no item looks
-      // like it: leave it out rather than guess.
-      if (!r || !r.item || !r.ok) return false;
-      // New pickup lines arrive bright; one only ever seen faded is an old
-      // line found again. And a faded look can't tell close names apart.
-      if (!p.t.bright) return false;
-      const ref = this.pickups.ref || 0;
-      if (r.margin < 0.01 && looks[0] && looks[0].s < 0.8 * ref) return false;
-      // one glimpse that only just picks a name: too little to go on
-      if (looks.length === 1 && r.margin < 0.03) return false;
-      // a poor fit that barely picks one name over another: a guess
-      if (r.cost > 0.87 && r.margin < 0.05) return false;
-      if (looks.length === 1 && r.cost > 0.75 && r.margin < 0.05) return false;
-      // The same line seen again: the pickup tracker sometimes loses a line
-      // and finds it once more. Same name, the old one gone young just as
-      // this one appeared: one pickup, not two.
-      // Each line counted so far keeps the tracks that followed it; a line
-      // is never in two places in one picture.
-      const t = p.t, dup = this.lootRecent.find(q => q.name === r.name &&
-        q.ts.some(m => sameLine(m, t) || sameLine(t, m)) && !q.ts.some(m => together(m, t)) && !fresher(q.ts, t, ref));
-      if (globalThis.LOOT_DEBUG) t.why = this.lootRecent.filter(q => q.name === r.name).map(q => [q.ts[0].born, q.ts.some(m => sameLine(m, t) || sameLine(t, m)), q.ts.some(m => together(m, t)), fresher(q.ts, t, ref)]);
-      if (dup) {
-        if (globalThis.LOOT_DEBUG) t.dupOf = dup.ts[0].born;
-        dup.ts.push(t); if (dup.ts.length > 12) dup.ts.shift();
-        return false;
-      }
-      this.lootRecent.push({ ts: [t], name: r.name });
-      if (this.lootRecent.length > 30) this.lootRecent.shift();
-      // a clear reading teaches the size item lines are drawn at here
-      if (r.cost < 0.62 && r.margin > 0.04) { this.lootKs.push(r.k); if (this.lootKs.length > 9) this.lootKs.shift(); }
-      const e = this.loot.get(r.name) || { name: r.name, id: r.id, type: r.type, count: 0 };
-      e.count++; this.loot.set(r.name, e); this.itemsSeen++;
-      t.lootName = r.name;
-      if (this.map) {                           // remember what drops here
-        const mem = (this.mapMemory[this.mapKey()] ||= {});
-        mem[r.name] = (mem[r.name] || 0) + 1; this.mapMemoryDirty = true;
-      }
+      const verdict = (() => {
+        // Not an item line after all ("You received EXP"), or no item looks
+        // like it: leave it out rather than guess.
+        if (!r || !r.item) return "not an item line";
+        if (!r.ok) return "no name fits";
+        // New pickup lines arrive bright; one only ever seen faded is an old
+        // line found again. And a faded look can't tell close names apart.
+        if (!p.t.bright) return "only seen faded";
+        const ref = this.pickups.ref || 0;
+        if (r.margin < 0.01 && looks[0] && looks[0].s < 0.8 * ref) return "too faint to tell";
+        // one glimpse that only just picks a name: too little to go on
+        if (looks.length === 1 && r.margin < 0.03) return "seen once, unsure";
+        // a poor fit that barely picks one name over another: a guess
+        if (r.cost > 0.87 && r.margin < 0.05) return "poor fit, unsure";
+        if (looks.length === 1 && r.cost > 0.75 && r.margin < 0.05) return "seen once, unsure";
+        // The same line seen again: the pickup tracker sometimes loses a line
+        // and finds it once more. Same name, the old one gone young just as
+        // this one appeared: one pickup, not two.
+        // Each line counted so far keeps the tracks that followed it; a line
+        // is never in two places in one picture.
+        const t = p.t, dup = this.lootRecent.find(q => q.name === r.name &&
+          q.ts.some(m => sameLine(m, t) || sameLine(t, m)) && !q.ts.some(m => together(m, t)) && !fresher(q.ts, t, ref));
+        if (globalThis.LOOT_DEBUG) t.why = this.lootRecent.filter(q => q.name === r.name).map(q => [q.ts[0].born, q.ts.some(m => sameLine(m, t) || sameLine(t, m)), q.ts.some(m => together(m, t)), fresher(q.ts, t, ref)]);
+        if (dup) {
+          if (globalThis.LOOT_DEBUG) t.dupOf = dup.ts[0].born;
+          dup.ts.push(t); if (dup.ts.length > 12) dup.ts.shift();
+          return "same line as before";
+        }
+        this.lootRecent.push({ ts: [t], name: r.name });
+        if (this.lootRecent.length > 30) this.lootRecent.shift();
+        // a clear reading teaches the size item lines are drawn at here
+        if (r.cost < 0.62 && r.margin > 0.04) { this.lootKs.push(r.k); if (this.lootKs.length > 9) this.lootKs.shift(); }
+        const e = this.loot.get(r.name) || { name: r.name, id: r.id, type: r.type, count: 0 };
+        e.count++; this.loot.set(r.name, e); this.itemsSeen++;
+        t.lootName = r.name;
+        if (this.map) {                           // remember what drops here
+          const mem = (this.mapMemory[this.mapKey()] ||= {});
+          mem[r.name] = (mem[r.name] || 0) + 1; this.mapMemoryDirty = true;
+        }
+        return "counted";
+      })();
+      this.noteLoot(now, p.t, looks, r, verdict);
       return false;
     });
   }
@@ -2123,7 +2163,25 @@ function inkSpan(a, w, h, thr) {
 export function itemLineLook(f, line, th) {
   const g = lineGlyphs(f, line, th), l = g && bandLook(g.seg, true);
   if (l && globalThis.LOOT_DEBUG) l.seg = g.seg;
+  if (l) l.pic = () => bandPicture(g.seg);
   return l;
+}
+
+/** A line's picture as text, small enough to keep a few hundred:
+ *  "w x h:" then one hex digit (0-f, dark to bright) per pixel, row by row,
+ *  scaled to 14 rows. */
+export function bandPicture({ band, bw, bh }) {
+  const H = 14, W = Math.max(1, Math.round(bw * H / bh));
+  let out = `${W}x${H}:`;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    // average of the pixels this one covers
+    const y0 = Math.floor(y * bh / H), y1 = Math.max(y0 + 1, Math.floor((y + 1) * bh / H));
+    const x0 = Math.floor(x * bw / W), x1 = Math.max(x0 + 1, Math.floor((x + 1) * bw / W));
+    let s = 0, n = 0;
+    for (let yy = y0; yy < y1; yy++) for (let xx = x0; xx < x1; xx++) { s += band[yy * bw + xx]; n++; }
+    out += Math.min(15, Math.round(15 * s / n)).toString(16);
+  }
+  return out;
 }
 export function bandLook({ band, bw, bh }, feed = false) {
   const span = inkSpan(band, bw, bh, 0.3);
@@ -2385,7 +2443,15 @@ export class LootMatcher {
   identify(looks, known = null, kRef = null) {
     if (!this.ready || !looks.length) return null;
     this.kRef = kRef;
-    try { return this.identify1(looks, known, kRef); } finally { this.kRef = null; }
+    try {
+      const r = this.identify1(looks, known, kRef);
+      if (!kRef || (r && r.item)) return r;
+      // Not an item line at the usual size. If it reads clearly at another
+      // size, the size has changed (or was learned wrong): trust the line.
+      this.kRef = null;
+      const r2 = this.identify1(looks, known, null);
+      return r2 && r2.ok && r2.cost < 0.62 && r2.margin > 0.04 ? r2 : r;
+    } finally { this.kRef = null; }
   }
   identify1(looks, known, kRef) {
     // the space before "x1", in drawn columns
@@ -2422,7 +2488,7 @@ export class LootMatcher {
   identifyAs(type, parts, known, space) {
     const names = this.byType[type];
     if (!names) return null;
-    const totals = new Map(); let used = 0;
+    const totals = new Map(), wfits = new Map(); let used = 0;
     for (const [look, hs] of parts) {
       const best = new Map();                         // per name, over the scale readings
       let any = false;
@@ -2462,7 +2528,7 @@ export class LootMatcher {
             if (!rn) continue;
             starts.forEach((x0, i) => {
               const wpen = Math.abs(Math.log((e - x0) / (h.k * rn)));
-              if (wpen <= 0.12) cands.push({ name, R, x0, i, extra: 2 * wpen + (i ? 0.02 : 0) + hp });
+              if (wpen <= 0.12) cands.push({ name, R, x0, i, wpen, extra: 2 * wpen + (i ? 0.02 : 0) + hp });
             });
           }
         }
@@ -2471,7 +2537,7 @@ export class LootMatcher {
         cands.sort((p, q) => p.d - q.d);
         for (const c of cands.slice(0, LootMatcher.CLOSE)) {
           const d = lookDtw(obs[c.i], lookSoft(lookResample(c.R, e - c.x0))) + c.extra;
-          if (d < best.get(c.name)) best.set(c.name, d);
+          if (d < best.get(c.name)) { best.set(c.name, d); wfits.set(c.name, c.wpen); }
         }
       }
       if (!any) continue;
@@ -2482,6 +2548,9 @@ export class LootMatcher {
     // Items already picked up this session or on this map are likelier.
     // Items already picked up are likelier, the more often the likelier.
     if (known) for (const [name, c] of totals) if (known.has(name)) totals.set(name, c - (known.get?.(name) ?? 0.02) * used);
+    // Quest items (403xxxx) look the same as monster drops when cut short
+    // ("Glowing Mushr..."): the drop is the likelier one.
+    for (const [name, c] of totals) { const id = names.get(name); if (id >= 4030000 && id < 4040000) totals.set(name, c + 0.005 * used); }
     const ranked = [...totals.entries()].sort((a, b) => a[1] - b[1]);
     const [name, cost] = ranked[0], second = ranked[1] ? ranked[1][1] : Infinity;
     const sd = parts.reduce((a, [, hs]) => a + hs[0].d, 0) / parts.length;
@@ -2504,7 +2573,8 @@ export class LootMatcher {
       }
       if (asOther < asItem) item = false;
     }
-    return { name, id: names.get(name), type, cost: cost / used, margin: (second - cost) / used, second: ranked[1]?.[0], sd, item,
+    const wfit = wfits.get(name) ?? 1;
+    return { name, id: names.get(name), type, cost: cost / used, margin: (second - cost) / used, second: ranked[1]?.[0], sd, item, wfit,
              ok: item && cost / used < LootMatcher.COST_MAX, ks: parts.map(([, hs]) => +hs[0].k.toFixed(2)),
              k: parts.reduce((a, [, hs]) => a + hs[0].k, 0) / parts.length };
   }
