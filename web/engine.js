@@ -972,6 +972,14 @@ function sameLine(a, b) {
 /** Two lines of the same length in the same picture are two lines (the
  *  same item twice). A track briefly following a neighbouring line of
  *  another length proves nothing. */
+const TOGETHER_ANY = true;
+/** A track's readings until it first jumped to another line (it dimmed all
+ *  at once: the line it jumped to is older). */
+function beforeHop(t) {
+  const fr = t.frames || [];
+  const hop = fr.findIndex((f, i) => i && f[2] !== undefined && fr[i - 1][2] !== undefined && f[0] - fr[i - 1][0] <= 250 && fr[i - 1][2] - f[2] > 15);
+  return hop > 0 ? fr.slice(0, hop) : fr;
+}
 function together(a, b) {
   // (only while each was being read: a track can drift onto a neighbour
   // of about the same length later on)
@@ -982,14 +990,23 @@ function together(a, b) {
   const own = (x, x0, x1) => { const ws = (x.frames || []).filter(f => f[0] >= x0 && f[0] <= x1).map(f => f[1]).sort((p, q) => p - q); return ws.length ? ws[ws.length >> 1] : 0; };
   const wa = own(a, a0, a1), wb = own(b, b0, b1);
   if (!wa || Math.abs(wa - wb) > 0.015 * wb) return false;
-  const fa = new Map((a.frames || []).filter(f => f[0] >= a0 && f[0] <= a1 && Math.abs(f[1] - wa) <= 0.015 * wa).map(f => [f[0], f[1]]));
-  return (b.frames || []).some(([t, w]) => t >= b0 && t <= b1 && Math.abs(w - wb) <= 0.015 * wb && fa.has(t));
+  // (the older line anywhere in its life; the newer one while being read)
+  // A track that just jumped to another line dims all at once (the line it
+  // jumped to is older): such readings don't count.
+  // (and from then on it may be anywhere)
+  const fr = beforeHop(a);
+  // (both read as item lines then: a meso line can be as long)
+  const fa = new Map(fr.filter(f => (TOGETHER_ANY || (f[0] >= a0 && f[0] <= a1)) && Math.abs(f[1] - wa) <= 0.015 * wa && f[3] !== "meso" && f[3] !== "exp").map(f => [f[0], f[1]]));
+  return (b.frames || []).some(([t, w, , ty]) => t >= b0 && t <= b1 && Math.abs(w - wb) <= 0.015 * wb && ty !== "meso" && ty !== "exp" && fa.has(t));
 }
 /** Is line b brighter at its start than the line a was when last seen?
  *  Lines only fade, so then b is a new line, not a found again. */
 function fresher(as, b, ref) {
-  const fb = (b.frames || []).slice(0, 3), w = fb.length ? fb[0][1] : 0;
-  if (!fb.length || fb[0][2] === undefined) return false;
+  // b's first readings, around its usual length (one can be a misread)
+  const f3 = (b.frames || []).slice(0, 3).filter(f => f[2] !== undefined);
+  if (!f3.length) return false;
+  const w = [...f3.map(f => f[1])].sort((p, q) => p - q)[f3.length >> 1];
+  const fb = f3.filter(f => Math.abs(f[1] - w) <= 0.06 * w);
   let last = null, at = -Infinity;
   for (const a of as) for (const f of a.frames || []) {
     if (f[0] > b.born || f[2] === undefined || Math.abs(f[1] - w) > 0.05 * w) continue;
@@ -1001,9 +1018,23 @@ function fresher(as, b, ref) {
   for (const a of as) for (const f of a.frames || []) if (f[2] !== undefined && f[0] <= at && f[0] >= at - 300 && Math.abs(f[1] - w) <= 0.05 * w) s = Math.max(s, f[2]);
   // (b must stay that bright: a track that started on a neighbouring line
   // proves nothing)
-  if (fb.length < 2 || Math.abs(fb[1][1] - w) > 0.04 * w) return false;
-  return Math.min(fb[0][2], fb[1][2]) - s > 0.05 * ref;
+  if (fb.length < 2) return false;
+  // (if the old line was already fading, it has faded further since)
+  if (FRESH_PROJECT) {
+    const fs = [];
+    for (const a of as) for (const f of a.frames || []) if (f[2] !== undefined && f[0] <= at && f[0] >= at - 600 && Math.abs(f[1] - w) <= 0.05 * w) fs.push(f);
+    fs.sort((p, q) => p[0] - q[0]);
+    if (fs.length >= 3 && fs[fs.length - 1][0] > fs[0][0]) {
+      const slope = Math.min(0, (fs[fs.length - 1][2] - fs[0][2]) / (fs[fs.length - 1][0] - fs[0][0]));   // per ms
+      s = Math.min(s, fs[fs.length - 1][2] + slope * Math.min(2000, b.born - at));
+    }
+  }
+  // (and b must be bright like a line that just arrived)
+  const sb = Math.min(fb[0][2], fb[1][2]);   // (the first two of them)
+  // (and brighter than the old line's very last reading, whatever its trend)
+  return sb >= 0.8 * ref && sb - s > 0.05 * ref && sb - last[2] > 0.03 * ref;
 }
+const FRESH_PROJECT = true;
 
 /** Ties it together: finds the HUD in frames, reads it, feeds a tracker.
  *  The page calls tick(now, getFrame) on a timer. */
@@ -1240,17 +1271,28 @@ export class Session {
     const fr = this.feedReader;
     const full = () => getFrame(null);
     if (!fr.anchor) {
-      if (now - fr.lastSearch < 1000) return null;     // about 0.15 s of work each try
+      // about 0.15 s of work each try: once a second (tried twice a second
+      // at first: the lines found early were read too poorly to help)
+      if (now - fr.lastSearch < 1000) return null;
       fr.lastSearch = now;
       const img = full();
       if (!img || !fr.locate(img)) return null;
       this.event(now, "hud", "Found the pickup messages");
+      // Found a while after starting (scenery behind the text can hide it
+      // for some seconds): the brightest lines arrived since, so they count.
+      this.pickups.lateStart = false;   // (tried counting lines still bright when found late: it counted lines from before too)
     } else if (now - this.feedOk > 30000 && now - fr.lastSearch > 10000) {
       // Nothing for a while: maybe the window moved. Look again (keep the
       // old spot unless a new one turns up).
       fr.lastSearch = now;
       const keep = fr.anchor, img = full();
       if (!img || !fr.locate(img)) fr.anchor = keep;
+    }
+    else if (now - (fr.lastCheck || 0) > 3000 && now - this.feedOk < 1000) {
+      // Every few seconds while lines are showing: is the spacing right?
+      fr.lastCheck = now;
+      const img = full();
+      if (img && fr.recheck(img)) this.event(now, "hud", "Corrected the spacing of the pickup messages");
     }
     const box = fr.box(), img = box && getFrame(box);
     if (!img) return null;
@@ -1336,7 +1378,10 @@ export class Session {
   /** The size item lines are drawn at, once a few clear readings agree. */
   lootScale() {
     const ks = [...(this.lootKs || [])].sort((a, b) => a - b);
-    return ks.length >= 3 ? ks[ks.length >> 1] : null;
+    if (ks.length >= 3) return ks[ks.length >> 1];
+    // Before that: lines are measured in text heights, so item text comes
+    // out at about the same size everywhere (wider if the screen stretches it)
+    return LOOT_K * (this.feedReader?.aspect || 1);
   }
   likelyLoot() {
     // name -> how much likelier (in naming cost per look)
@@ -1399,8 +1444,12 @@ export class Session {
         if (!r.ok) return "no name fits";
         // New pickup lines arrive bright; one only ever seen faded is an old
         // line found again. And a faded look can't tell close names apart.
-        if (!p.t.bright) return "only seen faded";
         const ref = this.pickups.ref || 0;
+        // (on a pale background new lines read dimmer: one that arrived at
+        // the bottom, reads clearly, and isn't a recent item seen again is
+        // let through)
+        if (!p.t.bright && !(p.t.bornSlot === 0 && looks[0] && looks[0].s >= 0.7 * ref && r.cost < 0.6 && r.margin >= 0.02 &&
+                             !this.lootRecent.some(q => q.name === r.name && q.ts.some(m => Math.abs(m.born - p.t.born) < 8000)))) return "only seen faded";
         if (r.margin < 0.01 && looks[0] && looks[0].s < 0.8 * ref) return "too faint to tell";
         // one glimpse that only just picks a name: too little to go on
         if (looks.length === 1 && r.margin < 0.03) return "seen once, unsure";
@@ -1876,11 +1925,22 @@ export class FeedReader {
     const f = feedInk(img);
     const r = feedLines(f);
     if (!r.xr || !r.lines.length) return null;
-    const th = feedTextHeight(r.lines);
-    if (!th) return null;
-    const read = r.lines.map(l => ({ l, r: readFeedLine(f, l, th, this.reader, this.aspect) }));
-    const good = read.filter(x => x.r.value !== null && x.r.type !== "other");
+    const th0 = feedTextHeight(r.lines);
+    if (!th0) return null;
+    // Scenery behind the text can make lines look taller than they are, so
+    // try a few text heights near the measured one: the one that reads the
+    // most lines as messages ("(+82)" after the right words) wins.
+    let read = null, good = [], kb = 1;
+    for (const k of [1, 0.9, 0.82, 1.1, 0.75]) {
+      const th = th0 * k;
+      const rd = r.lines.map(l => ({ l, r: readFeedLine(f, l, th, this.reader, this.aspect) }));
+      const gd = rd.filter(x => x.r.value !== null && x.r.type !== "other");
+      // (another height must read two lines at least: one could be luck)
+      if (gd.length > good.length && (k === 1 || gd.length >= 2)) { read = rd; good = gd; kb = k; }
+      if (good.length) break;                      // (the measured height, if it reads at all)
+    }
     if (!good.length) return null;
+    const th = th0 * kb;
     const real = read.filter(x => x.r.prefix !== undefined);       // lines ending in brackets
     if (!real.length) return null;
     // Line spacing: the period of the text rows ending at the right edge
@@ -1902,6 +1962,23 @@ export class FeedReader {
     this.samples = [];
     return this.anchor;
   }
+  /** Locate again from scratch without changing anything; if a few such
+   *  looks in a row agree on a different line spacing, the one in use was
+   *  wrong (a patterned wall can fake a spacing when locating): switch.
+   *  -> true if it switched. */
+  recheck(full) {
+    const keep = this.anchor, keepS = this.samples;
+    const got = this.locate(full);
+    this.anchor = keep; this.samples = keepS;
+    if (!got || !keep) return false;
+    if (Math.abs(got.pitch / keep.pitch - 1) < 0.12) { this.votes = []; return false; }
+    const v = (this.votes ||= []);
+    if (v.length && Math.abs(got.pitch / v[0].pitch - 1) > 0.05) v.length = 0;
+    v.push(got);
+    if (v.length < 3) return false;
+    this.anchor = got; this.samples = []; this.votes = [];
+    return true;
+  }
   /** The box the feed lives in (frame coordinates). */
   box() {
     const a = this.anchor; if (!a) return null;
@@ -1921,6 +1998,7 @@ export class FeedReader {
       const yb = a.yb - by - k * a.pitch;
       const l = feedLineAt(f, yb - 1.08 * a.th, yb + 0.12 * a.th, xr);
       if (!l) continue;
+      l.yb = yb;                                   // (where the line should sit)
       const o = { slot: k, strength: l.strength, width: (l.x1 - l.x0) / a.th, ...readFeedLine(f, l, a.th, this.reader, this.aspect) };
       // item lines: their look, to name the item (worked out only if the
       // pickup tracker wants it: it's slow)
@@ -1962,6 +2040,7 @@ export class FeedReader {
 export class FeedTracker {
   static WIDTH = true;      // use line lengths to tell lines apart
   static DROP = 0.25;       // the most a line fades between two readings
+  static YOUNG = false;     // a line read only once or twice proves less (tried: worse for mesos)
   constructor() {
     this.stack = [];          // bottom first: {type, value, reads, last, seen, miss, counted}
     this.ref = null;          // brightness of a fresh line
@@ -1997,13 +2076,15 @@ export class FeedTracker {
           if (o) {
             const sameValue = o.value !== null && t.value !== null && o.value === t.value;
             // a faded line's type is less certain; the same number is a good sign
-            if (o.type !== "other" && t.type !== "other" && o.type !== t.type) cost += sameValue ? 0.5 : o.strength >= fresh ? 3 : 1.5;
+            // (a line read only once or twice may simply have been misread)
+            const sureT = FeedTracker.YOUNG ? Math.min(1, 0.35 + 0.325 * ((t.reads?.length || 1) - 1)) : 1;
+            if (o.type !== "other" && t.type !== "other" && o.type !== t.type) cost += (sameValue ? 0.5 : o.strength >= fresh ? 3 : 1.5) * sureT;
             if (o.value !== null && t.value !== null && o.value !== t.value) cost += o.sure && o.strength >= fresh ? 2 : 0.7;
             // a line keeps its length: a clearly longer or shorter one is
             // another line (only judged while both are bright and whole)
             if (FeedTracker.WIDTH && t.width && o.width && o.strength >= fresh && t.last >= fresh) {
               const rel = Math.abs(o.width - t.width) / t.width;
-              if (rel > 0.08) cost += 2; else if (rel > 0.05) cost += 0.7;
+              if (rel > 0.08) cost += 2 * sureT; else if (rel > 0.05) cost += 0.7 * sureT;
             }
             // lines only fade: one that got brighter is a new line
             const up = (o.strength - t.last) / (this.ref || 150);
@@ -2024,9 +2105,13 @@ export class FeedTracker {
     }
     // new lines (slot k-1 is the oldest of them)
     const added = [];
+    // lines just arrived are the brightest (they fade after a second)
+    const maxS = obs.length ? Math.max(...obs.map(o => o.strength)) : 0;
     for (let j = k - 1; j >= 0; j--) added.push({ id: this.nextId++, bornSlot: j, type: "other", value: null, sureValue: false,
       reads: [], typeVotes: {}, valueVotes: {}, last: Infinity, seen: now, born: now, miss: 0, counted: false,
-      before: first });    // on screen when tracking began: picked up before it
+      // on screen when tracking began: picked up before it (unless tracking
+      // began a while ago and this line is still at its brightest)
+      before: first && !(this.lateStart && maxS >= 165 && (bySlot.get(j)?.strength ?? 0) >= 0.93 * maxS) });
     this.stack = added.reverse().concat(this.stack);
     // update every line with what's in its slot now: its type and value
     // are a vote over all its readings (bright, sure ones count more)
@@ -2034,7 +2119,7 @@ export class FeedTracker {
       const o = bySlot.get(i);
       if (!o) { t.miss++; return; }
       t.miss = 0; t.seen = now; t.last = o.strength; t.lastSlot = i;
-      if (o.width) { (t.frames ||= []).push([now, o.width, o.strength]); if (t.frames.length > 80) t.frames.shift(); }
+      if (o.width) { (t.frames ||= []).push([now, o.width, o.strength, o.type]); if (t.frames.length > 80) t.frames.shift(); }
       if (o.width && o.strength >= fresh) t.width = t.width ? 0.7 * t.width + 0.3 * o.width : o.width;
       if (o.strength >= fresh) t.bright = true;
       // (a guess from the line's length alone counts for less)
@@ -2145,6 +2230,7 @@ export function lineGlyphs(f, line, th) {
 // (" x1 earned. (Etc)") tells the scale and where the name stops.
 
 export const LOOT_ROWS = 12;
+const LOOT_K = 2.03;           // usual drawn size of item text in a look (see lootScale)
 export const LOOT_TYPES = ["Etc", "Use", "Equip", "Setup", "Cash"];
 
 /** Rows of the x-height (top, baseline) of a line of text. */
@@ -2295,6 +2381,7 @@ export class LootMatcher {
   static COST_MAX = 0.95;      // a name this close, or it is left out
   static NAME_MAX = 95;        // names wider than this (pixels) are cut short
   static CLOSE = 30;           // names compared closely, of those about as wide
+  static ENDS2 = false;        // also try the second likeliest end of the name (tried: wrong names)
   // the other messages in the same corner, to tell them from item lines
   static OTHER_ENDS = ["EXP (+63)", "EXP (+192)", "mesos (+70)", "mesos (+132)", "EXP (+7)", "mesos (+9)"];
   static OTHER = ["You received EXP (+63)", "You received EXP (+192)", "You have gained mesos (+70)",
@@ -2443,19 +2530,38 @@ export class LootMatcher {
   /** Where the name ends: at the space before "x1". The drawn suffix
    *  only places it roughly (the game spaces "x1 earned." a little
    *  differently), so look for the gap itself near there. */
-  static nameEnd(look, h, space) {
+  static nameEnd(look, h, space) { return LootMatcher.nameEnds(look, h, space)[0][0]; }
+  /** -> [[end, extra cost], ...]: the likeliest space, and the next one if
+   *  it is nearly as likely (within a few letters). */
+  static nameEnds(look, h, space) {
     const guess = Math.round(h.start - h.k * space), L = look.cols;
     const lo = Math.max(1, Math.round(guess - 6 * h.k)), hi = Math.min(look.n - 1, Math.round(h.start + 8 * h.k));
-    let best = null;
+    const found = [];
     for (let x = lo; x < hi;) {
       if (colInk(L, x) >= 0.05) { x++; continue; }
       const g0 = x; while (x < hi && colInk(L, x) < 0.05) x++;
       if (x - g0 >= 1.2 * h.k) {                         // a space, not just the gap between letters
-        const d = Math.abs(x - (h.start)) + 0.5 * Math.abs(g0 - guess);
-        if (!best || d < best.d) best = { d, e: g0 };
+        found.push({ d: Math.abs(x - (h.start)) + 0.5 * Math.abs(g0 - guess), e: g0 });
       }
     }
-    return best ? best.e : guess;
+    // A speck of the map can sit in the space: also the faintest stretch a
+    // space wide (a little less likely).
+    if (LootMatcher.ENDS2) {
+      const wd = Math.max(2, Math.round(1.2 * h.k));
+      let soft = null;
+      for (let x = lo; x + wd <= hi; x++) {
+        let m = 0; for (let c = x; c < x + wd; c++) m += colInk(L, c);
+        m /= wd;
+        if (m < 0.6 && (!soft || m < soft.m)) soft = { m, x };
+      }
+      if (soft && !found.some(f => Math.abs(f.e - soft.x) <= wd))
+        found.push({ d: Math.abs(soft.x + wd - h.start) + 0.5 * Math.abs(soft.x - guess) + 2, e: soft.x });
+    }
+    if (!found.length) return [[guess, 0]];
+    found.sort((p, q) => p.d - q.d);
+    const out = [[found[0].e, 0]];
+    if (LootMatcher.ENDS2 && found[1] && found[1].d - found[0].d < 6 * h.k) out.push([found[1].e, 0.04]);
+    return out;
   }
   /** Name an item from one or more looks of its line.
    *  -> {name, id, type, cost, margin} or null */
@@ -2513,8 +2619,9 @@ export class LootMatcher {
       let any = false;
       for (const h of hs) {
         if (h.type !== type) continue;
-        // the name ends a space before the "x1" (or "x14")
-        const e = LootMatcher.nameEnd(look, h, space);
+        // the name ends a space before the "x1" (or "x14"); if specks of
+        // the map blur that space, the next likeliest space is tried too
+        for (const [e, ep] of LootMatcher.nameEnds(look, h, space)) {
         if (e < 8) continue;
         any = true;
         // A speck of the map left of the name can join the line: also try
@@ -2536,7 +2643,7 @@ export class LootMatcher {
         }
         const obs = starts.map(x0 => lookSoft(look.cols.subarray(x0 * LOOT_ROWS, e * LOOT_ROWS)));
         // a reading of the end that fits less well costs a little
-        const hp = 0.5 * (h.d - hs[0].d);
+        const hp = 0.5 * (h.d - hs[0].d) + ep;
         // Every name about as wide as the line: a rough comparison at half
         // the detail first, then a close one for the likeliest few.
         const cands = [];
@@ -2558,6 +2665,7 @@ export class LootMatcher {
           const d = lookDtw(obs[c.i], lookSoft(lookResample(c.R, e - c.x0))) + c.extra;
           if (d < best.get(c.name)) { best.set(c.name, d); wfits.set(c.name, c.wpen); }
         }
+        }
       }
       if (!any) continue;
       used++;
@@ -2575,7 +2683,10 @@ export class LootMatcher {
     const sd = parts.reduce((a, [, hs]) => a + hs[0].d, 0) / parts.length;
     // Doesn't end in "earned. (Etc)" after all, or reads better as one of
     // the other messages ("You received EXP (+63)"): not an item.
-    let item = sd < LootMatcher.SUFFIX_MAX;
+    // (on a busy or pale background the end reads worse: one name standing
+    // well clear of the rest, closely matched, makes up for that)
+    const c1 = cost / used, m1 = (second - cost) / used;
+    let item = sd < LootMatcher.SUFFIX_MAX || (sd < 1.95 && (c1 <= 0.8 && m1 >= 0.04 || c1 <= 0.9 && m1 >= 0.15)) || (sd < 2.2 && c1 <= 0.65 && m1 >= 0.15);
     // ...and its end must look more like "earned. (Etc)" than "EXP (+63)"
     if (item) {
       let other = 0;
