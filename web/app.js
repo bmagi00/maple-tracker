@@ -39,7 +39,7 @@ const renderText = atlasRenderer(GLYPHS);
 // the list has an item, its entry there (with the icon) is used instead.
 const EXTRA_ITEMS = [
   // Thanksgiving event, November 2026 patch
-  ["Pumpkin Piece", "Etc"], ["Pie Flour", "Etc"], ["Turkey Egg", "Use"],
+  ["Pumpkin Piece", "Etc"], ["Pie Flour", "Etc"], ["Turkey Egg", "Use"], ["Milk Jug", "Etc"],
 ];
 function useItems(list) {
   const items = list.map(([id, name, t]) => ({ id, name, type: LOOT_TYPES[t] })), have = new Set(items.map(it => it.name));

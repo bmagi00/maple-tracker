@@ -1036,6 +1036,19 @@ function fresher(as, b, ref) {
 }
 const FRESH_PROJECT = true;
 
+/** How alike two names are: 1 the same, 0 nothing in common (edit distance). */
+function nameLikeness(a, b) {
+  a = a.toLowerCase(); b = b.toLowerCase();
+  if (!a.length || !b.length) return 0;
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    prev = cur;
+  }
+  return 1 - prev[b.length] / Math.max(a.length, b.length);
+}
+
 /** Ties it together: finds the HUD in frames, reads it, feeds a tracker.
  *  The page calls tick(now, getFrame) on a timer. */
 export class Session {
@@ -1455,6 +1468,13 @@ export class Session {
         if (looks.length === 1 && r.margin < 0.03) return "seen once, unsure";
         // a poor fit that barely picks one name over another: a guess
         if (r.cost > 0.87 && r.margin < 0.05) return "poor fit, unsure";
+      // A so-so fit whose runner-up is a quite different name: nothing
+      // really fits (often an item newer than the list). Look-alike names
+      // ("Mushroom Spore" / "Mushmom Spore") are just hard to tell apart.
+      if (r.cost > 0.72 && r.margin < 0.06 && nameLikeness(r.name, r.second || "") < 0.5) return "poor fit, unsure";
+      // Most looks prefer some quite different name: the track followed two
+      // lines (say "Jr. Boogie Horn" and "Decayed Charm").
+      if (r.split && 2 * (r.favs || []).filter(f => f && f !== r.name && nameLikeness(f, r.name) < 0.5).length > (r.favs || []).length) return "looks disagree";
         if (looks.length === 1 && r.cost > 0.75 && r.margin < 0.05) return "seen once, unsure";
         // The same line seen again: the pickup tracker sometimes loses a line
         // and finds it once more. Same name, the old one gone young just as
@@ -2385,7 +2405,7 @@ export class LootMatcher {
   // the other messages in the same corner, to tell them from item lines
   static OTHER_ENDS = ["EXP (+63)", "EXP (+192)", "mesos (+70)", "mesos (+132)", "EXP (+7)", "mesos (+9)"];
   static OTHER = ["You received EXP (+63)", "You received EXP (+192)", "You have gained mesos (+70)",
-                  "You have gained mesos (+132)"];
+                  "You have gained mesos (+132)", "Bonus EXP for PARTY (+10)", "Bonus EXP for PARTY (+7)"];
 
   constructor(render) {
     this.render = render; this.byType = {}; this.looks = new Map(); this.shown = new Map();
@@ -2613,7 +2633,7 @@ export class LootMatcher {
   identifyAs(type, parts, known, space) {
     const names = this.byType[type];
     if (!names) return null;
-    const totals = new Map(), wfits = new Map(); let used = 0;
+    const totals = new Map(), wfits = new Map(), favs = []; let used = 0;
     for (const [look, hs] of parts) {
       const best = new Map();                         // per name, over the scale readings
       let any = false;
@@ -2670,6 +2690,9 @@ export class LootMatcher {
       if (!any) continue;
       used++;
       for (const [name, c] of best) totals.set(name, (totals.get(name) || 0) + c);
+      // (each look's own favourite, to notice a track that mixed two lines)
+      let fav = null; for (const [name, c] of best) if (!fav || c < fav[1]) fav = [name, c];
+      favs.push(fav && fav[0]);
     }
     if (!used) return null;
     // Items already picked up this session or on this map are likelier.
@@ -2704,7 +2727,9 @@ export class LootMatcher {
       if (asOther < asItem) item = false;
     }
     const wfit = wfits.get(name) ?? 1;
-    return { name, id: names.get(name), type, cost: cost / used, margin: (second - cost) / used, second: ranked[1]?.[0], sd, item, wfit,
+    // Looks that each prefer another name: the track followed two lines.
+    const agree = favs.filter(f => f === name).length, split = favs.length >= 2 && 2 * agree < favs.length;
+    return { name, id: names.get(name), type, cost: cost / used, margin: (second - cost) / used, second: ranked[1]?.[0], sd, item, wfit, split, favs,
              ok: item && cost / used < LootMatcher.COST_MAX, ks: parts.map(([, hs]) => +hs[0].k.toFixed(2)),
              k: parts.reduce((a, [, hs]) => a + hs[0].k, 0) / parts.length };
   }
