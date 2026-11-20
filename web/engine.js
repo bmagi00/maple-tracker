@@ -1063,7 +1063,7 @@ export class Session {
     this.feedReader = feedReader ? new FeedReader(feedReader) : null;
     this.feedOk = 0; this.feedObs = [];
     this.hud = null; this.status = "idle"; this.lastOk = 0; this.lastSearch = 0;
-    this.mesoBox = null; this.mesoOk = 0; this.mesoSearch = 0; this.mesoSeen = false;
+    this.mesoBox = null; this.mesoOk = 0; this.mesoReadAt = 0; this.feedAtRead = 0; this.mesoSearch = 0; this.mesoSeen = false;
     this.prevUnsure = null; this.log = [];
     // The map, from the minimap title; read again after the screen goes
     // dark (changing maps). mapMemory: what has dropped on each map.
@@ -1082,6 +1082,9 @@ export class Session {
     // Mesos gained this session from either source: the inventory total
     // while it's visible, the pickup messages while it isn't.
     this.mesoGained = 0; this.mesoFromFeed = 0; this.mesoFromInv = 0; this.feedSeen = false; this.mesoRecent = [];
+    // Inventory rises waiting for their pickup message; when a meso pickup
+    // line was last on screen; what came in without one (shop sales).
+    this.invHeld = []; this.mesoLineAt = -Infinity; this.mesoSold = 0; this.soldEvent = null;
     this.pickups = new FeedTracker();
     // Items picked up this session: name -> {name, id, type, count}
     this.loot = new Map(); this.lootPending = []; this.lootRecent = []; this.lootKs = []; this.itemsSeen = 0; this.lootLog = [];
@@ -1138,7 +1141,7 @@ export class Session {
       pctStart: this.pctStart, pctEnd: this.currentPct(),
       exp: g === null ? null : Math.round(g),
       pctGained: this.mode === "pct" ? Math.round(this.pct.pctGained * 100) / 100 : null,
-      mesos: this.mesoSeen || this.feedSeen ? this.mesoGained : null, mesoSpent: this.meso.spent || 0,
+      mesos: this.mesoSeen || this.feedSeen ? this.mesoGained : null, mesoSpent: this.meso.spent || 0, mesoSold: this.mesoSold || 0,
       levelUps: this.mode === "amount" ? this.exp.levels : this.pct.levels,
       expLost: Math.round((this.mode === "amount" ? this.exp.lost : this.pct.lost) || 0),
       loot: this.lootList().map(e => [e.name, e.count, e.id]),
@@ -1246,6 +1249,7 @@ export class Session {
   }
   /** The meso total, if the Item Inventory window is open. */
   tickMeso(now, getFrame) {
+    this.settleInv(now);
     if ((!this.mesoBox || now - this.mesoOk > 4000) && now - this.mesoSearch > 4000) {
       // (a full-picture search: at most every 4 seconds)
       this.mesoSearch = now;
@@ -1264,8 +1268,10 @@ export class Session {
     if (value !== null) {
       // Back after being hidden while the pickups were being counted: those
       // pickups are already in, so start again from the new total.
-      if (this.feedSeen && this.mesoOk && now - this.mesoOk > 3000) { this.meso.last = null; this.meso.pending = []; }
-      this.mesoOk = now; this.mesoSeen = true;
+      // (Timed from the last number actually read: the field can stay in
+      // view with its digits hidden, and finding it again isn't reading it.)
+      if (this.mesoReadAt && now - this.mesoReadAt > 3000 && this.mesoFromFeed !== this.feedAtRead) { this.meso.last = null; this.meso.pending = []; }
+      this.mesoOk = now; this.mesoReadAt = now; this.feedAtRead = this.mesoFromFeed; this.mesoSeen = true;
     }
     const before = { gained: this.meso.gained, spent: this.meso.spent };
     const decision = this.meso.update(value, r.sure);
@@ -1273,12 +1279,42 @@ export class Session {
     const fmtN = n => Math.round(n).toLocaleString("en-US");
     if (decision === "spent") this.event(now, "meso", `Spent ${fmtN(this.meso.spent - before.spent)} mesos`);
     const got = this.meso.gained - before.gained;
-    this.mesoGained += got; this.mesoFromInv += got;
-    if (got >= 1000) this.event(now, "meso", `+${fmtN(got)} mesos`);
+    if (got > 0) this.invHeld.push({ at: now, d: got });
+    this.settleInv(now);
     return { text: r.text || "", value: value ?? "", decision };
   }
+  /** A rise in the inventory total counts only if a meso pickup message
+   *  showed around then. Selling to a shop (or a trade) raises the total
+   *  with no pickup message: that's not earnings, so it's left out. Without
+   *  the pickup messages to check against, every rise counts. */
+  static INV_WAIT = 3000;     // how long a rise waits for its pickup message
+  static INV_BEFORE = 8000;   // a message this long before the rise backs it too
+  settleInv(now) {
+    const fmtN = n => Math.round(n).toLocaleString("en-US");
+    const keep = [];
+    for (const h of this.invHeld) {
+      const backed = !this.feedReader || this.mesoLineAt >= h.at - Session.INV_BEFORE;
+      if (!backed && now - h.at < Session.INV_WAIT) { keep.push(h); continue; }
+      if (backed) {
+        this.mesoGained += h.d; this.mesoFromInv += h.d;
+        if (h.d >= 1000) this.event(h.at, "meso", `+${fmtN(h.d)} mesos`);
+        continue;
+      }
+      this.mesoSold += h.d;
+      // One log line per spell of selling, kept up to date.
+      const last = this.events[this.events.length - 1];
+      if (this.soldEvent && last === this.soldEvent && h.at - this.soldEvent.t < 60000) {
+        this.soldEvent.amount += h.d;
+      } else {
+        this.soldEvent = { t: h.at, kind: "meso", amount: h.d };
+        this.events.push(this.soldEvent); if (this.events.length > 500) this.events.shift();
+      }
+      this.soldEvent.text = `Left out +${fmtN(this.soldEvent.amount)} mesos with no pickup message (selling to a shop or a trade)`;
+    }
+    this.invHeld = keep;
+  }
   /** Pickup messages: called often (about 10 times a second). */
-  inventoryVisible(now) { return !!this.mesoBox && now - this.mesoOk < 2500; }
+  inventoryVisible(now) { return !!this.mesoBox && now - (this.mesoReadAt || 0) < 2500; }
   tickFeed(now, getFrame) {
     if (!this.running || !this.feedReader) return null;
     const fr = this.feedReader;
@@ -1311,6 +1347,7 @@ export class Session {
     if (!img) return null;
     const obs = fr.read(img);
     if (obs.length) this.feedOk = now;
+    if (obs.some(o => o.type === "meso")) this.mesoLineAt = now;
     // Loot tracking off: item lines are still tracked (so their lines aren't
     // mistaken for mesos), but never looked at closely or named.
     if (!this.lootOn) for (const o of obs) delete o.lookFn;
@@ -1561,11 +1598,11 @@ export class Session {
     if (req && pct !== null && rate > 0) eta = (100 - pct) / 100 * req / rate * 3600;
     else if (pct !== null && pctHr > 0) eta = (100 - pct) / pctHr * 3600;
     const mesos = this.mesoSeen || this.feedSeen ? this.mesoGained : null;
-    const mesoVisible = !!this.mesoBox && now - this.mesoOk < 6000;
+    const mesoVisible = !!this.mesoBox && now - (this.mesoReadAt || 0) < 6000;
     const feedActive = !!this.feedReader?.anchor && now - this.feedOk < 60000;
     return {
       mesos, mesoHr, mesoTotal: this.meso.last,
-      mesoSpent: this.meso.spent, mesoVisible, mesoTracking: !!this.mesoReader,
+      mesoSpent: this.meso.spent, mesoSold: this.mesoSold || 0, mesoVisible, mesoTracking: !!this.mesoReader,
       feedActive, mesoFromFeed: this.mesoFromFeed, mesoFromInv: this.mesoFromInv,
       running: !!this.running, status: this.status, elapsed: el, mode: this.mode,
       exp: g, expHr, nowHr, pctHr, level, pct, eta,
@@ -2397,6 +2434,7 @@ function lookDtw(A, B, band = 4, step = 0.3) {
 /** Names item lines by comparing them with candidate names drawn by
  *  `render(text) -> {w, h, a}` (a: 0-1 coverage, same baseline for all). */
 export class LootMatcher {
+  static KIND_RETRY = 0.55;    // a name fitting worse than this: try the other kinds too
   static SUFFIX_MAX = 1.86;    // fixed end "x1 earned. (Etc)" this close, or it's another line
   static COST_MAX = 0.95;      // a name this close, or it is left out
   static NAME_MAX = 95;        // names wider than this (pixels) are cut short
@@ -2512,7 +2550,7 @@ export class LootMatcher {
   scales() {
     return this.kRef ? [0.92 * this.kRef, 1.08 * this.kRef, 1] : [1.3, 3.0, 2];
   }
-  suffix(look) {
+  suffix(look, slack = 1.15) {
     const fit = (S, sn, n, type, count) => this.fitEnd(look, S, sn, n, type, count);
     const all = [];
     if (this.kRef) {
@@ -2540,7 +2578,7 @@ export class LootMatcher {
     all.sort((p, q) => p.d - q.d);
     const picks = [];
     for (const h of all) {
-      if (h.d > all[0].d * 1.15) break;
+      if (h.d > all[0].d * slack) break;
       const sameType = picks.filter(p => p.type === h.type);
       if (sameType.length >= 2 || picks.length >= 5) continue;
       if (sameType.every(p => Math.abs(Math.log(p.k / h.k)) > 0.04)) picks.push(h);
@@ -2625,6 +2663,17 @@ export class LootMatcher {
     for (const type of kinds) {
       const r = this.identifyAs(type, parts, known, space);
       if (r && (!res || r.cost < res.cost)) res = r;
+    }
+    // Something over the end of the line (a mob, a speck) can hide the kind
+    // in brackets, so the wrong kind fits best there. The rest of the line
+    // ("x1 earned. (") is the same for every kind: if the name reads poorly,
+    // try the other kinds' names at the same spot, and keep a much better fit.
+    if (res && res.cost > LootMatcher.KIND_RETRY) {
+      for (const type of LOOT_TYPES) {
+        if (kinds.has(type)) continue;
+        const r = this.identifyAs(type, parts.map(([look, hs]) => [look, hs.map(h => ({ ...h, type }))]), known, space);
+        if (r && r.cost < LootMatcher.KIND_RETRY && r.cost < res.cost - 0.12) res = r;
+      }
     }
     // A track that wandered between lines must read clearly to count.
     if (res && mixed && (res.cost > 0.7 || res.margin < 0.05)) res.ok = false;

@@ -80,5 +80,19 @@ check("feed digit examples present", Object.keys(FEED_SEEDS).length >= 10);
   const got = M.identify([E.bandLook({ band, bw, bh })]);
   check(`item names from glyph pictures (${Math.round(w)}px, read "${got?.name}")`, Math.abs(w - 94) < 2 && got?.name === "Squishy Liquid" && got.item);
 }
+// Shop sales: an inventory rise with no meso pickup message isn't earnings.
+{
+  const s = new E.Session(null, { feedReader: {} });
+  s.mesoLineAt = 1000; s.invHeld.push({ at: 2000, d: 37 }); s.settleInv(2000);          // a pickup
+  s.invHeld.push({ at: 60000, d: 5200 }); s.settleInv(61000);                           // waiting
+  const waiting = s.invHeld.length === 1 && s.mesoGained === 37;
+  s.settleInv(63500);                                                                   // a sale
+  s.invHeld.push({ at: 64000, d: 800 }); s.settleInv(67500);                            // another
+  s.invHeld.push({ at: 90000, d: 25 }); s.mesoLineAt = 91000; s.settleInv(91000);       // message after
+  const noFeed = new E.Session(null); noFeed.invHeld.push({ at: 0, d: 500 }); noFeed.settleInv(0);
+  check(`shop sales left out of mesos (gained ${s.mesoGained}, sold ${s.mesoSold})`,
+    waiting && s.mesoGained === 62 && s.mesoSold === 6000 && s.events.filter(e => /no pickup/.test(e.text)).length === 1
+    && noFeed.mesoGained === 500);
+}
 console.log(fail ? `RESULT: FAIL (${fail})` : "RESULT: PASS");
 process.exit(fail ? 1 : 0);

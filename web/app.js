@@ -40,6 +40,7 @@ const renderText = atlasRenderer(GLYPHS);
 const EXTRA_ITEMS = [
   // Thanksgiving event, November 2026 patch
   ["Pumpkin Piece", "Etc"], ["Pie Flour", "Etc"], ["Turkey Egg", "Use"], ["Milk Jug", "Etc"],
+  ["Pumpkin Pie", "Use"], ["Roasted Turkey", "Use"],
 ];
 function useItems(list) {
   const items = list.map(([id, name, t]) => ({ id, name, type: LOOT_TYPES[t] })), have = new Set(items.map(it => it.name));
@@ -453,7 +454,7 @@ function render() {
     : s.feedActive ? `Counting the pickup messages${s.mesoTotal !== null ? ` (last total seen ${fmt(s.mesoTotal)})` : ""}`
     : s.mesoTotal !== null ? `Total ${fmt(s.mesoTotal)} (inventory not visible)` : "\u00a0";
   $("meso-total").innerHTML = s.mesos !== null
-    ? `<strong>+${fmt(s.mesos)}</strong> mesos this session${s.mesoSpent ? `, ${fmt(s.mesoSpent)} spent` : ""}`
+    ? `<strong>+${fmt(s.mesos)}</strong> mesos this session${s.mesoSpent ? `, ${fmt(s.mesoSpent)} spent` : ""}${s.mesoSold ? `, ${fmt(s.mesoSold)} from selling (not counted)` : ""}`
     : "Pick up some mesos, or open your Item Inventory for your total.";
 
   // session line
