@@ -1447,7 +1447,7 @@ export class Session {
   noteLoot(now, t, looks, r, verdict) {
     const l = looks[0], log = (this.lootLog ||= []);
     log.push({ time: new Date(now).toISOString(), born: new Date(t.born).toISOString(), verdict,
-               name: r?.name ?? "", second: r?.second ?? "", cost: r ? +r.cost.toFixed(3) : "",
+               name: r?.name ?? "", count: r?.count ?? "", second: r?.second ?? "", cost: r ? +r.cost.toFixed(3) : "",
                margin: r ? +r.margin.toFixed(3) : "", looks: looks.length, pic: l?.look?.pic ? l.look.pic() : "" });
     if (log.length > Session.LOOT_LOG) log.shift();
   }
@@ -1518,7 +1518,8 @@ export class Session {
         // this one appeared: one pickup, not two.
         // Each line counted so far keeps the tracks that followed it; a line
         // is never in two places in one picture.
-        const t = p.t, dup = this.lootRecent.find(q => q.name === r.name &&
+        // (a different stack size is a different line: "x4" then "x3")
+        const t = p.t, qty = r.count || 1, dup = this.lootRecent.find(q => q.name === r.name && (q.qty || 1) === qty &&
           q.ts.some(m => sameLine(m, t) || sameLine(t, m)) && !q.ts.some(m => together(m, t)) && !fresher(q.ts, t, ref));
         if (globalThis.LOOT_DEBUG) t.why = this.lootRecent.filter(q => q.name === r.name).map(q => [q.ts[0].born, q.ts.some(m => sameLine(m, t) || sameLine(t, m)), q.ts.some(m => together(m, t)), fresher(q.ts, t, ref)]);
         if (dup) {
@@ -1526,13 +1527,14 @@ export class Session {
           dup.ts.push(t); if (dup.ts.length > 12) dup.ts.shift();
           return "same line as before";
         }
-        this.lootRecent.push({ ts: [t], name: r.name });
+        this.lootRecent.push({ ts: [t], name: r.name, qty });
         if (this.lootRecent.length > 30) this.lootRecent.shift();
         // a clear reading teaches the size item lines are drawn at here
         if (r.cost < 0.62 && r.margin > 0.04) { this.lootKs.push(r.k); if (this.lootKs.length > 9) this.lootKs.shift(); }
         const e = this.loot.get(r.name) || { name: r.name, id: r.id, type: r.type, count: 0 };
-        e.count++; this.loot.set(r.name, e); this.itemsSeen++;
-        t.lootName = r.name;
+        // the count is how many came in ("Milk Jug x10" adds 10)
+        e.count += qty; this.loot.set(r.name, e); this.itemsSeen += qty;
+        t.lootName = r.name; t.lootQty = qty;
         if (this.map) {                           // remember what drops here
           const mem = (this.mapMemory[this.mapKey()] ||= {});
           mem[r.name] = (mem[r.name] || 0) + 1; this.mapMemoryDirty = true;
@@ -1547,7 +1549,8 @@ export class Session {
     this.lootPending = this.lootPending.filter(p => p.t !== t);
     const e = t.lootName && this.loot.get(t.lootName);
     if (e) {
-      e.count--; this.itemsSeen--; if (e.count <= 0) this.loot.delete(t.lootName);
+      const qty = t.lootQty || 1;
+      e.count -= qty; this.itemsSeen -= qty; if (e.count <= 0) this.loot.delete(t.lootName);
       const mem = this.mapMemory[this.mapKey()];
       if (mem?.[t.lootName]) { if (--mem[t.lootName] <= 0) delete mem[t.lootName]; this.mapMemoryDirty = true; }
       t.lootName = null;
@@ -2434,6 +2437,8 @@ function lookDtw(A, B, band = 4, step = 0.3) {
 /** Names item lines by comparing them with candidate names drawn by
  *  `render(text) -> {w, h, a}` (a: 0-1 coverage, same baseline for all). */
 export class LootMatcher {
+  static COUNT_TAIL_MAX = 1.5;   // " earned. (Etc)" drawn worse than this: too unclear, call it x1
+  static COUNT_BETTER = 0.92;     // a number other than 1 must fit this much better
   static KIND_RETRY = 0.55;    // a name fitting worse than this: try the other kinds too
   static SUFFIX_MAX = 1.86;    // fixed end "x1 earned. (Etc)" this close, or it's another line
   static COST_MAX = 0.95;      // a name this close, or it is left out
@@ -2677,7 +2682,67 @@ export class LootMatcher {
     }
     // A track that wandered between lines must read clearly to count.
     if (res && mixed && (res.cost > 0.7 || res.margin < 0.05)) res.ok = false;
+    if (res && res.type && res.k) res.count = this.countOf(parts.map(p => p[0]), res.type, res.k);
     return res;
+  }
+  /** How many came in the stack: the number in "x10 earned. (Etc)". The
+   *  fixed " earned. (Etc)" places the line; then the part before it ("x10")
+   *  is drawn with each digit in turn and compared on its own, at the
+   *  line's size. "x1" is by far the commonest: another number must fit
+   *  clearly better. The looks vote. */
+  countOf(looks, type, k) {
+    const votes = new Map();
+    for (const look of looks.slice(0, 3)) {
+      const T = this.textLook(`earned. (${type})`), tn = T.length / LOOT_ROWS;
+      let tail = null;
+      for (let n = Math.round(k * tn) - 1; n <= Math.round(k * tn) + 1; n++) { const f = this.fitEnd(look, T, tn, n); if (f && (!tail || f.d < tail.d)) tail = f; }
+      if (!tail || tail.d > LootMatcher.COUNT_TAIL_MAX) { votes.set("1", (votes.get("1") || 0) + 1); continue; }
+      const end = tail.start + Math.round(tail.k * tn), kk = tail.k;
+      const fit = digits => {
+        const S = this.textLook(`x${digits} earned. (${type})`), sn = S.length / LOOT_ROWS;
+        let best = null;
+        for (let n = Math.round(kk * sn) - 1; n <= Math.round(kk * sn) + 1; n++) {
+          const w = n - Math.round(kk * tn), Sr = this.stretched(S, n);
+          for (let sh = -1; sh <= 1; sh++) {
+            const s0 = end - n + sh;
+            if (s0 < 0 || w < 4) continue;
+            let d = 0;
+            for (let i = 0; i < w * LOOT_ROWS; i++) d += Math.abs(look.cols[s0 * LOOT_ROWS + i] - Sr[i]);
+            d /= w;
+            if (best === null || d < best) best = d;
+          }
+        }
+        return best;
+      };
+      const one = fit("1");
+      let best = { d: one, s: "1" };
+      for (let D = 1; D <= 3; D++) {
+        const ds = ["1", ...Array(D - 1).fill("0")];
+        let cur = null;
+        for (let pass = 0; pass < (D === 1 ? 1 : 2); pass++) for (let j = 0; j < D; j++) {
+          for (const c of j === 0 ? "123456789" : "0123456789") {
+            const t = [...ds]; t[j] = c;
+            const d = fit(t.join(""));
+            if (d !== null && (!cur || d < cur.d)) cur = { d, s: t.join("") };
+          }
+          if (cur) ds.splice(0, D, ...cur.s);
+        }
+        if (cur && cur.d < best.d) best = cur;
+      }
+      if (best.s !== "1" && !(best.d < one * LootMatcher.COUNT_BETTER)) best = { d: one, s: "1" };
+      if (globalThis.COUNT_DEBUG) globalThis.COUNT_DEBUG.push({ tail: tail.d, one, best });
+      votes.set(best.s, (votes.get(best.s) || 0) + 1);
+    }
+    let n = 1, v = 0;
+    for (const [s, w] of votes) if (w > v) { v = w; n = Number(s); }
+    return n;
+  }
+  /** How well a text drawn at size k (give or take a column) fits the line's end. */
+  fitText(look, text, k) {
+    const S = this.textLook(text), sn = S.length / LOOT_ROWS, n0 = Math.round(k * sn);
+    let best = null;
+    for (let n = n0 - 1; n <= n0 + 1; n++) { const f = this.fitEnd(look, S, sn, n); if (f && (best === null || f.d < best)) best = f.d; }
+    return best;
   }
   identifyAs(type, parts, known, space) {
     const names = this.byType[type];

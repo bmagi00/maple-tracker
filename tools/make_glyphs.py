@@ -22,6 +22,13 @@ for key, fn in [("regular", "Regular"), ("bold", "Bold")]:
             glyphs[ch] = [round(adv, 4), x0 - 4, x1 - x0, base64.b64encode(data.tobytes()).decode()]
         else:
             glyphs[ch] = [round(adv, 4), 0, 0, ""]
+    # MapleStory's "1" has no foot (Liberation's does at 12px): the bottom
+    # row becomes the stem alone, like the row above it.
+    adv, x0, w, b = glyphs["1"]
+    a = np.frombuffer(base64.b64decode(b), np.uint8).reshape(H, w).copy()
+    rows = np.where(a.max(1) > 0)[0]
+    a[rows[-1]] = a[rows[-2]]
+    glyphs["1"] = [adv, x0, w, base64.b64encode(a.tobytes()).decode()]
     # kerning pairs that matter (fractional px)
     kern = {}
     for a_ in range(33, 127):

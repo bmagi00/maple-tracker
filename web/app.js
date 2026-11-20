@@ -676,7 +676,7 @@ $("download").onclick = () => {
   // while this tab is open): the name given, what became of it, and a small
   // picture of the line as read, to check the name against.
   const items = (session.lootLog || []).map(l => ({
-    time: l.time, item: l.name, itemResult: l.verdict,
+    time: l.time, item: l.name && l.count > 1 ? `${l.name} x${l.count}` : l.name, itemResult: l.verdict,
     itemDetail: `line seen ${l.born.slice(11, 22)}; looks ${l.looks}; fit ${l.cost}; next best ${l.second} (+${l.margin})`,
     itemPicture: l.pic,
   }));

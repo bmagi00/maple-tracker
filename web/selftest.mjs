@@ -79,6 +79,13 @@ check("feed digit examples present", Object.keys(FEED_SEEDS).length >= 10);
   for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) band[y * bw + x] = r.a[(y >> 1) * r.w + (x >> 1)];
   const got = M.identify([E.bandLook({ band, bw, bh })]);
   check(`item names from glyph pictures (${Math.round(w)}px, read "${got?.name}")`, Math.abs(w - 94) < 2 && got?.name === "Squishy Liquid" && got.item);
+  // stack sizes: "x10" adds 10
+  const counts = ["x1", "x10", "x6", "x23", "x3"].map(q => {
+    const r = render(`Tree Branch ${q} earned. (Etc)`), bw = r.w * 2, bh = r.h * 2, band = new Float32Array(bw * bh);
+    for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) band[y * bw + x] = r.a[(y >> 1) * r.w + (x >> 1)];
+    return M.identify([E.bandLook({ band, bw, bh })])?.count;
+  });
+  check(`stack sizes from glyph pictures (${counts.join(" ")})`, counts.join(" ") === "1 10 6 23 3");
 }
 // Shop sales: an inventory rise with no meso pickup message isn't earnings.
 {
