@@ -267,7 +267,8 @@ function renderLog() {
 // ---------------------------------------------------------------- capture
 const video = $("video"), work = $("work");
 const wctx = work.getContext("2d", { willReadFrequently: true });
-let stream = null, track = null, imageCapture = null, source = null;
+let stream = null, track = null, imageCapture = null, source = null, captureFull = false;
+const CAPTURE_FPS = 10;
 
 async function shareWindow() {
   if (!navigator.mediaDevices?.getDisplayMedia) {
@@ -279,12 +280,14 @@ async function shareWindow() {
     // send half-size pictures, too blurry for the game's small digits.
     // Open the picker on "Window"; browser tabs are refused below.
     const opts = { audio: false, selfBrowserSurface: "exclude", surfaceSwitching: "include", preferCurrentTab: false };
-    const vopts = { frameRate: { ideal: 10, max: 30 }, displaySurface: "window" };
+    // Ten pictures a second is what the tracker reads; a little headroom so
+    // a fresh one is never far off. No more: capturing costs the game too.
+    const vopts = { frameRate: { ideal: CAPTURE_FPS, max: 15 }, displaySurface: "window" };
     let s;
-    try { s = await navigator.mediaDevices.getDisplayMedia({ ...opts, video: { ...vopts, resizeMode: "none" } }); }
+    try { s = await navigator.mediaDevices.getDisplayMedia({ ...opts, video: { ...vopts, resizeMode: "none" } }); captureFull = true; }
     catch (e) {
       if (e?.name !== "OverconstrainedError" && e?.name !== "TypeError") throw e;
-      s = await navigator.mediaDevices.getDisplayMedia({ ...opts, video: vopts });
+      s = await navigator.mediaDevices.getDisplayMedia({ ...opts, video: vopts }); captureFull = false;
     }
     // A browser tab can't show the game: say so and stop.
     if (s.getVideoTracks()[0]?.getSettings?.().displaySurface === "browser") {
@@ -640,7 +643,20 @@ function drawOverlayCanvas(s) {
 }
 
 // ---------------------------------------------------------------- controls
-function toggle() { if (!source) return; session.running ? session.stop() : session.start(); saveCurrent(); render(); }
+function toggle() {
+  if (!source) return;
+  session.running ? session.stop() : session.start();
+  captureRate(session.running ? CAPTURE_FPS : 1);
+  saveCurrent(); render();
+}
+/** How many pictures a second the share takes: one while paused, so a
+ *  paused share costs the game next to nothing. */
+function captureRate(fps) {
+  if (source !== "window" || !track?.applyConstraints) return;
+  const c = { frameRate: { ideal: fps, max: fps === CAPTURE_FPS ? 15 : fps } };
+  if (captureFull) c.resizeMode = "none";
+  track.applyConstraints(c).catch(() => {});
+}
 $("share").onclick = shareWindow;
 $("stop").onclick = stopSharing;
 $("share-2").onclick = shareWindow;
