@@ -1287,6 +1287,7 @@ export class Session {
    *  showed around then. Selling to a shop (or a trade) raises the total
    *  with no pickup message: that's not earnings, so it's left out. Without
    *  the pickup messages to check against, every rise counts. */
+  static NEW_NAME_MAX = 0.6;  // a name new to this session and map must fit at least this well
   static INV_WAIT = 3000;     // how long a rise waits for its pickup message
   static INV_BEFORE = 8000;   // a message this long before the rise backs it too
   settleInv(now) {
@@ -1336,12 +1337,18 @@ export class Session {
       fr.lastSearch = now;
       const keep = fr.anchor, img = full();
       if (!img || !fr.locate(img)) fr.anchor = keep;
+      else this.pickups.restart();
     }
     else if (now - (fr.lastCheck || 0) > 3000 && now - this.feedOk < 1000) {
       // Every few seconds while lines are showing: is the spacing right?
       fr.lastCheck = now;
       const img = full();
-      if (img && fr.recheck(img)) this.event(now, "hud", "Corrected the spacing of the pickup messages");
+      if (img && fr.recheck(img)) {
+        this.event(now, "hud", "Corrected the spacing of the pickup messages");
+        // The lines showing now sit in new places: without this they'd all
+        // look new and count again. They were counted (or missed) already.
+        this.pickups.restart();
+      }
     }
     const box = fr.box(), img = box && getFrame(box);
     if (!img) return null;
@@ -1509,6 +1516,11 @@ export class Session {
       // really fits (often an item newer than the list). Look-alike names
       // ("Mushroom Spore" / "Mushmom Spore") are just hard to tell apart.
       if (r.cost > 0.72 && r.margin < 0.06 && nameLikeness(r.name, r.second || "") < 0.5) return "poor fit, unsure";
+      // A name not seen this session or on this map, from a poor fit that
+      // only just beats the next name: in the logs these were all wrong
+      // (skill effects over the line, a covered end, an item newer than the
+      // list). Real first drops that read poorly still win clearly.
+      if (r.cost > Session.NEW_NAME_MAX && r.margin < 0.08 && !this.likelyLoot().has(r.name)) return "new name, poor fit";
       // Most looks prefer some quite different name: the track followed two
       // lines (say "Jr. Boogie Horn" and "Decayed Charm").
       if (r.split && 2 * (r.favs || []).filter(f => f && f !== r.name && nameLikeness(f, r.name) < 0.5).length > (r.favs || []).length) return "looks disagree";
@@ -2109,6 +2121,9 @@ export class FeedTracker {
     this.nextId = 1;
   }
   fresh() { return this.ref ? 0.82 * this.ref : 0; }
+  /** The lines' places changed (the spacing was corrected): forget them;
+   *  the lines showing at the next look are old ones, not counted again. */
+  restart() { this.stack = []; this.started = false; }
   update(now, obs) {
     for (const o of obs) {
       if (this.ref === null || o.strength > this.ref) this.ref = o.strength;
